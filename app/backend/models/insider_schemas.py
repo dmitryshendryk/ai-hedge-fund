@@ -2,6 +2,7 @@
 
 Defines all request/response models for the insider trading dashboard,
 supporting Forms 3, 4, and 5 from the SEC EDGAR edgartools API.
+Also defines schemas for the 13F-HR institutional holdings tab.
 """
 from pydantic import BaseModel
 
@@ -169,3 +170,166 @@ class GrantsResponse(BaseModel):
     records: list[GrantRecord]
     total: int
     skipped_count: int = 0
+
+
+class ThirteenFFilingListItem(BaseModel):
+    """Lightweight filing entry for the paginated 13-F listing.
+
+    Core fields are populated from PyArrow-backed Filings index attributes.
+    Optional enrichment fields (signer_name, total_value, total_holdings) are
+    populated via ``filing.obj()`` when available.
+    """
+
+    filing_date: str
+    accession_no: str
+    company: str
+    cik: int
+    form: str
+    signer_name: str | None = None
+    signer_title: str | None = None
+    total_value: float | None = None
+    total_holdings: int | None = None
+
+
+class ThirteenFListResponse(BaseModel):
+    """Paginated response for GET /insider/thirteenf.
+
+    has_more signals whether additional pages exist beyond the current offset.
+    skipped_count reports filings that could not be parsed during extraction.
+    """
+
+    filings: list[ThirteenFFilingListItem]
+    total: int
+    has_more: bool
+    skipped_count: int = 0
+
+
+class ThirteenFCompanyItem(BaseModel):
+    """Company name + CIK pair for the company dropdown."""
+
+    company: str
+    cik: int
+
+
+class ThirteenFCompaniesResponse(BaseModel):
+    """Response for GET /insider/thirteenf/companies."""
+
+    companies: list[ThirteenFCompanyItem]
+    total: int
+
+
+class ThirteenFSavedSelectionsResponse(BaseModel):
+    """Response for GET /insider/thirteenf/selections."""
+
+    selections: list[ThirteenFCompanyItem]
+    total: int
+
+
+class ThirteenFSaveSelectionsRequest(BaseModel):
+    """Request body for PUT /insider/thirteenf/selections."""
+
+    ciks: list[int]
+
+
+class CompareHoldingsRecord(BaseModel):
+    """One row from the compare_holdings() DataFrame for quarter-over-quarter diff.
+
+    All numeric fields are optional because a filing's first appearance has no
+    previous quarter values (status='NEW') and a closed position has no current
+    quarter values (status='CLOSED').
+    """
+
+    cusip: str
+    ticker: str | None = None
+    issuer: str
+    shares: int | None = None
+    prev_shares: int | None = None
+    value: int | None = None
+    prev_value: int | None = None
+    share_change: int | None = None
+    share_change_pct: float | None = None
+    value_change: int | None = None
+    value_change_pct: float | None = None
+    status: str
+
+
+class CompareHoldingsResponse(BaseModel):
+    """Response for GET /insider/thirteenf/compare.
+
+    Returns quarter-over-quarter holding comparison for a single filing
+    identified by accession_no.
+    """
+
+    accession_no: str
+    current_period: str
+    previous_period: str
+    manager_name: str
+    records: list[CompareHoldingsRecord]
+    total: int
+
+
+class HoldingHistoryRecord(BaseModel):
+    """One row from the holding_history() DataFrame for multi-period view.
+
+    periods_data maps period date strings (e.g. '2025-12-31') to share counts
+    or None when the holding was absent in that period. Using a nested dict
+    avoids top-level dynamic keys and provides clean TypeScript typing.
+    """
+
+    cusip: str
+    ticker: str | None = None
+    issuer: str
+    periods_data: dict[str, int | None]
+    change_pct: float | None = None
+
+
+class HoldingHistoryResponse(BaseModel):
+    """Response for GET /insider/thirteenf/history.
+
+    periods lists the date strings used as keys in each record's periods_data,
+    ordered oldest-to-newest, enabling the frontend to render ordered columns.
+    """
+
+    accession_no: str
+    manager_name: str
+    periods: list[str]
+    records: list[HoldingHistoryRecord]
+    total: int
+
+
+class AggregateHoldingCompanyDetail(BaseModel):
+    """Per-company breakdown within an aggregated ticker row."""
+
+    company: str
+    cik: int
+    shares: int | None = None
+    prev_shares: int | None = None
+    share_change_pct: float | None = None
+    value: int | None = None
+    prev_value: int | None = None
+    value_change_pct: float | None = None
+    status: str
+
+
+class AggregateHoldingRecord(BaseModel):
+    """One ticker row aggregated across multiple 13F-HR filers."""
+
+    ticker: str
+    issuer: str
+    companies: int
+    company_details: list[AggregateHoldingCompanyDetail]
+    total_shares: int
+    total_value: int
+    total_prev_shares: int
+    total_prev_value: int
+    avg_share_change_pct: float | None = None
+    avg_value_change_pct: float | None = None
+
+
+class AggregateHoldingsResponse(BaseModel):
+    """Response for GET /insider/thirteenf/aggregate."""
+
+    records: list[AggregateHoldingRecord]
+    total: int
+    companies_processed: int
+    errors: list[str]

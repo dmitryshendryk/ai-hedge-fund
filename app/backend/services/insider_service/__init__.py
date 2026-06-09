@@ -10,14 +10,41 @@ get_ownership_changes and get_insider_grants are defined here so that tests
 patching insider_service._fetch_ownership_changes and
 insider_service._grants._fetch_grants intercept the calls correctly.
 
+The 13F-HR entry points (get_thirteenf_filings, get_compare_holdings,
+get_holding_history) are also defined here so that tests can patch
+insider_service._fetch_thirteenf_filings, insider_service._fetch_compare_holdings,
+and insider_service._fetch_holding_history to intercept the calls correctly.
+
 All other logic lives in sub-modules (_summary, _detail, _ownership, _grants,
-_helpers) and is imported here for backwards-compatible access.
+_helpers, _thirteenf) and is imported here for backwards-compatible access.
 """
 import asyncio
 import time
 from collections import OrderedDict
+from datetime import date
 
-from app.backend.models.insider_schemas import GrantsResponse, OwnershipChangesResponse  # noqa: F401
+from app.backend.models.insider_schemas import (  # noqa: F401
+    AggregateHoldingsResponse,
+    CompareHoldingsResponse,
+    GrantsResponse,
+    HoldingHistoryResponse,
+    OwnershipChangesResponse,
+    ThirteenFCompaniesResponse,
+    ThirteenFListResponse,
+)
+from app.backend.services.insider_service._thirteenf import (  # noqa: F401
+    _fetch_thirteenf_filings,
+)
+from app.backend.services.insider_service._thirteenf_companies import (  # noqa: F401
+    _fetch_thirteenf_companies,
+    _read_companies_from_db,
+    _sync_companies_to_db,
+)
+from app.backend.services.insider_service._thirteenf_detail import (  # noqa: F401
+    _fetch_aggregate_holdings,
+    _fetch_compare_holdings,
+    _fetch_holding_history,
+)
 from app.backend.services.insider_service._detail import _fetch_detail, _parse_trade_rows, get_insider_detail  # noqa: F401
 from app.backend.services.insider_service._grants import _fetch_grants  # noqa: F401
 from app.backend.services.insider_service._helpers import (  # noqa: F401
@@ -104,5 +131,134 @@ async def get_insider_grants(ticker: str, form_type: str = "4", limit: int = 50,
     if isinstance(cached, GrantsResponse):
         return cached
     result = await asyncio.to_thread(_grants._fetch_grants, ticker, form_type, limit, offset)
+    _cache_put(cache_key, result)
+    return result
+
+
+# ---------------------------------------------------------------------------
+# 13F-HR async entry points — defined here so tests can patch
+# insider_service._fetch_thirteenf_filings etc. to intercept calls.
+# ---------------------------------------------------------------------------
+
+
+async def get_thirteenf_filings(
+    limit: int,
+    offset: int,
+    year: int | None,
+    quarter: int | None,
+    company_name: str | None = None,
+    cik_list: list[int] | None = None,
+    date_from: str | None = None,
+    date_to: str | None = None,
+) -> ThirteenFListResponse:
+    """Async entry point for paginated 13F-HR filing listing. Checks LRU+TTL cache first.
+
+    The cache key includes today's date (``date.today().isoformat()``) so that
+    the listing expires daily and new SEC filings are picked up automatically.
+    Empty or whitespace-only ``company_name`` values are normalized to ``None``
+    before cache key construction so they produce the same cache entry as no
+    company filter.
+
+    Args:
+        limit: Maximum number of filings to return (page size).
+        offset: Number of filings to skip before the current page.
+        year: Optional filing year filter; forwarded to the worker when not None.
+        quarter: Optional filing quarter filter (1–4); forwarded when not None.
+        company_name: Optional company name for fuzzy search. Empty or
+            whitespace-only values are normalized to None.
+        date_from: Optional start date filter (ISO: YYYY-MM-DD).
+        date_to: Optional end date filter (ISO: YYYY-MM-DD).
+
+    Returns:
+        ThirteenFListResponse with filings, total count, has_more, and skipped_count.
+    """
+    company_name = company_name.strip() or None if company_name else None
+    cik_key = ",".join(str(c) for c in sorted(cik_list)) if cik_list else None
+    cache_key = f"thirteenf:filings:{date.today().isoformat()}:{year}:{quarter}:{company_name}:{cik_key}:{date_from}:{date_to}:{limit}:{offset}"
+    cached = _cache_get(cache_key)
+    if isinstance(cached, ThirteenFListResponse):
+        return cached
+    result = await asyncio.to_thread(_fetch_thirteenf_filings, limit, offset, year, quarter, company_name, cik_list, date_from, date_to)
+    _cache_put(cache_key, result)
+    return result
+
+
+async def get_compare_holdings(accession_no: str) -> CompareHoldingsResponse:
+    """Async entry point for quarter-over-quarter holding comparison. Checks LRU+TTL cache first.
+
+    ValueError from the worker (no comparison data, filing not found) is not
+    caught here — it propagates to the route handler for 404 mapping.
+
+    Args:
+        accession_no: SEC accession number in ``NNNNNNNNNN-YY-NNNNNN`` format.
+
+    Returns:
+        CompareHoldingsResponse with records and period metadata.
+
+    Raises:
+        ValueError: Propagated from worker when comparison data is unavailable.
+        RuntimeError: Propagated from worker on SEC API errors.
+    """
+    cache_key = f"thirteenf:compare:{accession_no}"
+    cached = _cache_get(cache_key)
+    if isinstance(cached, CompareHoldingsResponse):
+        return cached
+    result = await asyncio.to_thread(_fetch_compare_holdings, accession_no)
+    _cache_put(cache_key, result)
+    return result
+
+
+async def get_holding_history(accession_no: str, periods: int) -> HoldingHistoryResponse:
+    """Async entry point for multi-period holding history. Checks LRU+TTL cache first.
+
+    ValueError from the worker (no history data, filing not found) is not
+    caught here — it propagates to the route handler for 404 mapping.
+
+    Args:
+        accession_no: SEC accession number in ``NNNNNNNNNN-YY-NNNNNN`` format.
+        periods: Number of historical periods to include.
+
+    Returns:
+        HoldingHistoryResponse with records and ordered period list.
+
+    Raises:
+        ValueError: Propagated from worker when history data is unavailable.
+        RuntimeError: Propagated from worker on SEC API errors.
+    """
+    cache_key = f"thirteenf:history:{accession_no}:{periods}"
+    cached = _cache_get(cache_key)
+    if isinstance(cached, HoldingHistoryResponse):
+        return cached
+    result = await asyncio.to_thread(_fetch_holding_history, accession_no, periods)
+    _cache_put(cache_key, result)
+    return result
+
+
+async def get_thirteenf_companies() -> ThirteenFCompaniesResponse:
+    """Async entry point for company names. Reads from DB (fast), falls back to edgartools if empty."""
+    cache_key = f"thirteenf:companies:{date.today().isoformat()}"
+    cached = _cache_get(cache_key)
+    if isinstance(cached, ThirteenFCompaniesResponse):
+        return cached
+    # Fast path: read from SQLite
+    result = _read_companies_from_db()
+    if result.total > 0:
+        _cache_put(cache_key, result)
+        return result
+    # Cold start: DB is empty, sync from edgartools then return
+    await asyncio.to_thread(_sync_companies_to_db)
+    result = _read_companies_from_db()
+    _cache_put(cache_key, result)
+    return result
+
+
+async def get_aggregate_holdings(cik_list: list[int]) -> AggregateHoldingsResponse:
+    """Async entry point for aggregated holdings across multiple companies. Checks LRU+TTL cache first."""
+    cik_key = ",".join(str(c) for c in sorted(cik_list))
+    cache_key = f"thirteenf:aggregate:{cik_key}"
+    cached = _cache_get(cache_key)
+    if isinstance(cached, AggregateHoldingsResponse):
+        return cached
+    result = await asyncio.to_thread(_fetch_aggregate_holdings, cik_list)
     _cache_put(cache_key, result)
     return result

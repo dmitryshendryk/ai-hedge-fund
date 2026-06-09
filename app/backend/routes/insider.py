@@ -1,21 +1,47 @@
 """FastAPI routes for insider trading data.
 
-Exposes four endpoints:
+Exposes endpoints:
 - GET /insider/summary  -- filing-level summaries for the dashboard table and cards
 - GET /insider/detail   -- per-transaction drill-down for a specific SEC filing
 - GET /insider/ownership -- per-insider ownership change history for the ownership sub-page
 - GET /insider/grants   -- derivative trades (grants, exercises, conversions) sub-page
+- GET /insider/thirteenf -- paginated listing of 13F-HR filings across all companies
+- GET /insider/thirteenf/compare -- quarter-over-quarter holding comparison for a single filing
+- GET /insider/thirteenf/history -- multi-period holding history for a single filing
 
-All endpoints validate the ``ticker`` query parameter against ``^[A-Z]{1,5}$``
-using FastAPI's ``Query`` validator to prevent malformed values from reaching
-the edgartools backend.
+Ticker-based endpoints validate the ``ticker`` parameter against ``^[A-Z]{1,5}$``.
+13F-HR endpoints validate ``accession_no`` against ``^\\d{10}-\\d{2}-\\d{6}$`` using
+FastAPI's ``Query`` validator to reject malformed values before they reach the service layer.
 """
 import logging
 
 from fastapi import APIRouter, HTTPException, Query
 
-from app.backend.models.insider_schemas import GrantsResponse, InsiderDetailResponse, InsiderSummaryResponse, OwnershipChangesResponse
-from app.backend.services.insider_service import get_insider_detail, get_insider_grants, get_insider_summary, get_ownership_changes
+from app.backend.models.insider_schemas import (
+    AggregateHoldingsResponse,
+    CompareHoldingsResponse,
+    GrantsResponse,
+    HoldingHistoryResponse,
+    InsiderDetailResponse,
+    InsiderSummaryResponse,
+    OwnershipChangesResponse,
+    ThirteenFCompaniesResponse,
+    ThirteenFListResponse,
+    ThirteenFSaveSelectionsRequest,
+    ThirteenFSavedSelectionsResponse,
+    ThirteenFCompanyItem,
+)
+from app.backend.services.insider_service import (
+    get_aggregate_holdings,
+    get_compare_holdings,
+    get_holding_history,
+    get_insider_detail,
+    get_insider_grants,
+    get_insider_summary,
+    get_ownership_changes,
+    get_thirteenf_companies,
+    get_thirteenf_filings,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -139,3 +165,222 @@ async def insider_grants(
     except Exception as exc:
         logger.exception("Failed to fetch insider grants for ticker=%s", ticker)
         raise HTTPException(status_code=500, detail=f"Failed to fetch insider grants: {exc}") from exc
+
+
+@router.get(
+    "/thirteenf",
+    response_model=ThirteenFListResponse,
+    responses={
+        422: {"description": "Invalid query parameters"},
+        500: {"description": "Internal server error"},
+    },
+)
+async def insider_thirteenf(
+    limit: int = Query(20, ge=1, le=100, description="Maximum number of filings to return (page size)"),
+    offset: int = Query(0, ge=0, le=100000, description="Number of filings to skip before the current page"),
+    year: int | None = Query(None, description="Optional filing year filter"),
+    quarter: int | None = Query(None, ge=1, le=4, description="Optional filing quarter filter (1–4)"),
+    company_name: str | None = Query(None, min_length=2, max_length=100, description="Optional company name for fuzzy search"),
+    ciks: str | None = Query(None, description="Comma-separated CIK numbers to filter by specific companies"),
+    date_from: str | None = Query(None, description="Start date filter (ISO: YYYY-MM-DD)"),
+    date_to: str | None = Query(None, description="End date filter (ISO: YYYY-MM-DD)"),
+) -> ThirteenFListResponse:
+    """Return a paginated listing of 13F-HR filings across all companies.
+
+    No ticker is required. ``year`` and ``quarter`` are optional filters forwarded
+    to ``get_filings(form='13F-HR')``. ``company_name`` enables fuzzy search via
+    ``Filings.find()`` which combines company lookup and CIK filtering internally.
+    ``ciks`` accepts a comma-separated list of CIK numbers to filter by specific companies.
+    ``has_more`` signals whether additional pages exist beyond the current offset.
+    """
+    cik_list: list[int] | None = None
+    if ciks:
+        try:
+            cik_list = [int(c.strip()) for c in ciks.split(",") if c.strip()]
+        except ValueError as exc:
+            raise HTTPException(status_code=422, detail="ciks must be comma-separated integers") from exc
+    try:
+        return await get_thirteenf_filings(limit=limit, offset=offset, year=year, quarter=quarter, company_name=company_name, cik_list=cik_list, date_from=date_from, date_to=date_to)
+    except HTTPException:
+        raise
+    except Exception as exc:
+        logger.exception("Failed to fetch 13F-HR filings limit=%d offset=%d year=%s quarter=%s company_name=%s ciks=%s", limit, offset, year, quarter, company_name, ciks)
+        raise HTTPException(status_code=500, detail=f"Failed to fetch 13F-HR filings: {exc}") from exc
+
+
+@router.get(
+    "/thirteenf/companies",
+    response_model=ThirteenFCompaniesResponse,
+    responses={500: {"description": "Internal server error"}},
+)
+async def insider_thirteenf_companies() -> ThirteenFCompaniesResponse:
+    """Return unique company names across all 13F-HR filings for the filter dropdown."""
+    try:
+        return await get_thirteenf_companies()
+    except Exception as exc:
+        logger.exception("Failed to fetch 13F-HR company list")
+        raise HTTPException(status_code=500, detail=f"Failed to fetch 13F-HR company list: {exc}") from exc
+
+
+@router.post(
+    "/thirteenf/companies/refresh",
+    responses={500: {"description": "Internal server error"}},
+)
+async def insider_thirteenf_companies_refresh() -> dict[str, object]:
+    """Trigger a manual refresh of the cached 13F-HR company list from edgartools."""
+    import asyncio
+    from app.backend.services.insider_service._thirteenf_companies import _sync_companies_to_db
+
+    try:
+        count = await asyncio.to_thread(_sync_companies_to_db)
+        return {"status": "ok", "companies_synced": count}
+    except Exception as exc:
+        logger.exception("Failed to refresh 13F-HR company list")
+        raise HTTPException(status_code=500, detail=f"Failed to refresh company list: {exc}") from exc
+
+
+@router.get(
+    "/thirteenf/selections",
+    response_model=ThirteenFSavedSelectionsResponse,
+    responses={500: {"description": "Internal server error"}},
+)
+async def insider_thirteenf_selections() -> ThirteenFSavedSelectionsResponse:
+    """Return saved company selections from the database."""
+    from app.backend.database.connection import SessionLocal
+    from app.backend.database.models import ThirteenFSavedSelection
+
+    db = SessionLocal()
+    try:
+        rows = db.query(ThirteenFSavedSelection).order_by(ThirteenFSavedSelection.company).all()
+        items = [ThirteenFCompanyItem(company=r.company, cik=r.cik) for r in rows]
+        return ThirteenFSavedSelectionsResponse(selections=items, total=len(items))
+    except Exception as exc:
+        logger.exception("Failed to fetch saved selections")
+        raise HTTPException(status_code=500, detail=f"Failed to fetch saved selections: {exc}") from exc
+    finally:
+        db.close()
+
+
+@router.put(
+    "/thirteenf/selections",
+    response_model=ThirteenFSavedSelectionsResponse,
+    responses={500: {"description": "Internal server error"}},
+)
+async def insider_thirteenf_save_selections(body: ThirteenFSaveSelectionsRequest) -> ThirteenFSavedSelectionsResponse:
+    """Replace all saved company selections with the provided CIKs."""
+    from app.backend.database.connection import SessionLocal
+    from app.backend.database.models import ThirteenFSavedSelection, ThirteenFCompany
+
+    db = SessionLocal()
+    try:
+        # Delete all existing selections
+        db.query(ThirteenFSavedSelection).delete()
+
+        if body.ciks:
+            # Resolve company names from the companies cache table
+            companies = db.query(ThirteenFCompany).filter(ThirteenFCompany.cik.in_(body.ciks)).all()
+            cik_to_company = {c.cik: c.company for c in companies}
+
+            for cik in body.ciks:
+                company_name = cik_to_company.get(cik, f"CIK {cik}")
+                db.add(ThirteenFSavedSelection(cik=cik, company=company_name))
+
+        db.commit()
+
+        # Return the new state
+        rows = db.query(ThirteenFSavedSelection).order_by(ThirteenFSavedSelection.company).all()
+        items = [ThirteenFCompanyItem(company=r.company, cik=r.cik) for r in rows]
+        return ThirteenFSavedSelectionsResponse(selections=items, total=len(items))
+    except Exception as exc:
+        db.rollback()
+        logger.exception("Failed to save selections")
+        raise HTTPException(status_code=500, detail=f"Failed to save selections: {exc}") from exc
+    finally:
+        db.close()
+
+
+@router.get(
+    "/thirteenf/aggregate",
+    response_model=AggregateHoldingsResponse,
+    responses={
+        422: {"description": "Invalid ciks parameter"},
+        500: {"description": "Internal server error"},
+    },
+)
+async def insider_thirteenf_aggregate(
+    ciks: str = Query(..., description="Comma-separated CIK numbers to aggregate holdings for"),
+) -> AggregateHoldingsResponse:
+    """Return aggregated holdings across multiple companies, grouped by ticker."""
+    try:
+        cik_list = [int(c.strip()) for c in ciks.split(",") if c.strip()]
+    except ValueError as exc:
+        raise HTTPException(status_code=422, detail="ciks must be comma-separated integers") from exc
+    if not cik_list:
+        raise HTTPException(status_code=422, detail="At least one CIK is required")
+    try:
+        return await get_aggregate_holdings(cik_list=cik_list)
+    except HTTPException:
+        raise
+    except Exception as exc:
+        logger.exception("Failed to fetch aggregate holdings for ciks=%s", ciks)
+        raise HTTPException(status_code=500, detail=f"Failed to fetch aggregate holdings: {exc}") from exc
+
+
+@router.get(
+    "/thirteenf/compare",
+    response_model=CompareHoldingsResponse,
+    responses={
+        404: {"description": "No comparison data available (no previous quarter found)"},
+        422: {"description": "Malformed accession_no (must match \\d{10}-\\d{2}-\\d{6})"},
+        500: {"description": "Internal server error"},
+    },
+)
+async def insider_thirteenf_compare(
+    accession_no: str = Query(..., pattern=r"^\d{10}-\d{2}-\d{6}$", description="SEC accession number (e.g. '0001234567-26-000001')"),
+) -> CompareHoldingsResponse:
+    """Return quarter-over-quarter holding comparison for a single 13F-HR filing.
+
+    ``accession_no`` must match ``\\d{10}-\\d{2}-\\d{6}`` — FastAPI returns 422
+    automatically for malformed values. Returns 404 when no previous quarter is
+    available for comparison.
+    """
+    try:
+        return await get_compare_holdings(accession_no=accession_no)
+    except ValueError as exc:
+        raise HTTPException(status_code=404, detail=str(exc)) from exc
+    except HTTPException:
+        raise
+    except Exception as exc:
+        logger.exception("Failed to fetch compare holdings for accession_no=%s", accession_no)
+        raise HTTPException(status_code=500, detail=f"Failed to fetch compare holdings: {exc}") from exc
+
+
+@router.get(
+    "/thirteenf/history",
+    response_model=HoldingHistoryResponse,
+    responses={
+        404: {"description": "No holding history available for this filing"},
+        422: {"description": "Malformed accession_no (must match \\d{10}-\\d{2}-\\d{6})"},
+        500: {"description": "Internal server error"},
+    },
+)
+async def insider_thirteenf_history(
+    accession_no: str = Query(..., pattern=r"^\d{10}-\d{2}-\d{6}$", description="SEC accession number (e.g. '0001234567-26-000001')"),
+    periods: int = Query(4, ge=1, le=8, description="Number of historical periods to include"),
+) -> HoldingHistoryResponse:
+    """Return multi-period holding history for a single 13F-HR filing.
+
+    ``accession_no`` must match ``\\d{10}-\\d{2}-\\d{6}`` — FastAPI returns 422
+    automatically for malformed values. Returns 404 when no history data is
+    available. ``periods`` controls how many quarters of history are returned
+    (default 4, max 8).
+    """
+    try:
+        return await get_holding_history(accession_no=accession_no, periods=periods)
+    except ValueError as exc:
+        raise HTTPException(status_code=404, detail=str(exc)) from exc
+    except HTTPException:
+        raise
+    except Exception as exc:
+        logger.exception("Failed to fetch holding history for accession_no=%s periods=%d", accession_no, periods)
+        raise HTTPException(status_code=500, detail=f"Failed to fetch holding history: {exc}") from exc
