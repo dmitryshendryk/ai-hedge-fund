@@ -22,11 +22,13 @@ Burst protection:
 
 import asyncio
 import logging
+import math
 import time
 from collections import OrderedDict
 from dataclasses import dataclass
 from datetime import date, datetime, timedelta, timezone
 
+import pandas as pd
 import yfinance as yf
 
 logger = logging.getLogger(__name__)
@@ -69,6 +71,29 @@ def _trigger_cooldown() -> None:
 def _is_rate_limit_message(text: str) -> bool:
     lower = text.lower()
     return "too many requests" in lower or "rate limit" in lower
+
+
+def _compute_rsi(closes: "pd.Series", period: int = 14) -> float | None:
+    """Wilder's RSI on a close-price series. None when < period+1 finite closes.
+
+    Uses exponential (Wilder) smoothing rather than a simple rolling mean so
+    the value matches what charting tools report.
+    """
+    series = closes.dropna()
+    if len(series) < period + 1:
+        return None
+    delta = series.diff().dropna()
+    gains = delta.clip(lower=0.0)
+    losses = (-delta).clip(lower=0.0)
+    avg_gain = gains.ewm(alpha=1.0 / period, adjust=False).mean().iloc[-1]
+    avg_loss = losses.ewm(alpha=1.0 / period, adjust=False).mean().iloc[-1]
+    if avg_loss == 0:
+        return 100.0 if avg_gain > 0 else 50.0
+    rs = avg_gain / avg_loss
+    rsi = 100.0 - (100.0 / (1.0 + rs))
+    if not math.isfinite(rsi):
+        return None
+    return round(float(rsi), 2)
 
 
 @dataclass
@@ -126,7 +151,11 @@ def _coerce_since(since: date | datetime | str) -> date:
 def _fetch_period_sync(ticker: str, since: date) -> PeriodReturn | None:
     """Synchronous yfinance fetch. Raises _RateLimited on transient throttling
     (caller decides whether to retry / skip caching); returns None for any
-    other failure mode (delisted, malformed data, network)."""
+    other failure mode (delisted, malformed data, network).
+
+    Drops trailing rows whose Close is NaN (yfinance often returns an open
+    bar for the current trading day before the close print lands, which
+    would propagate NaN into every downstream return calculation)."""
     end = date.today() + timedelta(days=1)
     if since >= end:
         return None
@@ -140,14 +169,24 @@ def _fetch_period_sync(ticker: str, since: date) -> PeriodReturn | None:
         return None
     if history is None or history.empty:
         return None
-    first_idx = history.index[0]
-    last_idx = history.index[-1]
+
     try:
-        start_close = float(history.iloc[0]["Close"])
-        end_close = float(history.iloc[-1]["Close"])
+        closed = history.dropna(subset=["Close"])
+    except KeyError:
+        return None
+    if closed.empty:
+        return None
+
+    first_idx = closed.index[0]
+    last_idx = closed.index[-1]
+    try:
+        start_close = float(closed.iloc[0]["Close"])
+        end_close = float(closed.iloc[-1]["Close"])
     except (KeyError, ValueError, TypeError):
         return None
     if start_close <= 0 or end_close <= 0:
+        return None
+    if not (math.isfinite(start_close) and math.isfinite(end_close)):
         return None
     return PeriodReturn(
         start_date=first_idx.strftime("%Y-%m-%d"),
@@ -215,9 +254,16 @@ async def compute_alpha(ticker: str, since: date | datetime | str) -> AlphaMetri
     ticker_data = await get_period_return(ticker, since_d)
     if ticker_data is None or spy_data is None:
         return None
+    # _fetch_period_sync already rejects start_price <= 0, but guard again
+    # in case a future cache entry slips through with a zero — division by
+    # zero produces inf which then crashes JSON serialization downstream.
+    if ticker_data.start_price <= 0 or spy_data.start_price <= 0:
+        return None
 
     ticker_return_pct = (ticker_data.end_price / ticker_data.start_price - 1.0) * 100.0
     spy_return_pct = (spy_data.end_price / spy_data.start_price - 1.0) * 100.0
+    if not (math.isfinite(ticker_return_pct) and math.isfinite(spy_return_pct)):
+        return None
     return AlphaMetrics(
         ticker=ticker.upper(),
         period_return_pct=ticker_return_pct,
@@ -254,3 +300,127 @@ async def compute_alpha_batch(items: list[tuple[str, date | datetime | str]]) ->
         else:
             out[ticker.upper()] = res
     return out
+
+
+@dataclass
+class SmaCross:
+    """Latest close vs N-day simple moving average."""
+    ticker: str
+    latest_close: float
+    sma: float
+    pct_above_sma: float  # negative when close < SMA (breakdown)
+
+
+def _compute_sma_sync(ticker: str, days: int) -> SmaCross | None:
+    """Fetch ~days+10 calendar days of bars, drop incomplete trailing rows,
+    average the last `days` closes, compare to the latest finite close."""
+    end = date.today() + timedelta(days=1)
+    start = end - timedelta(days=int(days * 1.6) + 10)  # buffer for weekends/holidays
+    try:
+        history = yf.Ticker(ticker).history(start=start, end=end, auto_adjust=True)
+    except Exception as exc:
+        msg = str(exc)
+        if _is_rate_limit_message(msg):
+            raise _RateLimited(msg) from exc
+        logger.warning("pricing_service SMA failed for %s: %s", ticker, exc)
+        return None
+    if history is None or history.empty:
+        return None
+    try:
+        closed = history.dropna(subset=["Close"])
+    except KeyError:
+        return None
+    if len(closed) < days:
+        return None
+
+    closes = closed["Close"].tail(days)
+    try:
+        sma = float(closes.mean())
+        latest = float(closes.iloc[-1])
+    except (ValueError, TypeError):
+        return None
+    if not (math.isfinite(sma) and math.isfinite(latest)) or sma <= 0:
+        return None
+    return SmaCross(
+        ticker=ticker.upper(),
+        latest_close=latest,
+        sma=sma,
+        pct_above_sma=(latest / sma - 1.0) * 100.0,
+    )
+
+
+async def get_sma_cross(ticker: str, days: int = 200) -> SmaCross | None:
+    """Cached: latest close vs N-day SMA. Used by the technical_breakdown
+    exit-alert rule. Shares the global yfinance cooldown / semaphore guard.
+    """
+    if _is_in_cooldown():
+        return None
+    async with _yfinance_semaphore:
+        try:
+            return await asyncio.to_thread(_compute_sma_sync, ticker.upper(), days)
+        except _RateLimited:
+            _trigger_cooldown()
+            return None
+
+
+@dataclass
+class TechnicalSnapshot:
+    """Single-fetch technical read for exhaustion detectors."""
+    ticker: str
+    latest_close: float
+    sma200: float
+    pct_above_sma: float  # (close/sma - 1) * 100; negative below trend
+    rsi14: float | None
+
+
+def _compute_technical_snapshot_sync(ticker: str, days: int) -> TechnicalSnapshot | None:
+    end = date.today() + timedelta(days=1)
+    start = end - timedelta(days=int(days * 1.6) + 30)
+    try:
+        history = yf.Ticker(ticker).history(start=start, end=end, auto_adjust=True)
+    except Exception as exc:
+        msg = str(exc)
+        if _is_rate_limit_message(msg):
+            raise _RateLimited(msg) from exc
+        logger.warning("pricing_service technical snapshot failed for %s: %s", ticker, exc)
+        return None
+    if history is None or history.empty:
+        return None
+    try:
+        closed = history.dropna(subset=["Close"])
+    except KeyError:
+        return None
+    if len(closed) < days:
+        return None
+
+    closes = closed["Close"]
+    window = closes.tail(days)
+    try:
+        sma = float(window.mean())
+        latest = float(closes.iloc[-1])
+    except (ValueError, TypeError):
+        return None
+    if not (math.isfinite(sma) and math.isfinite(latest)) or sma <= 0:
+        return None
+    return TechnicalSnapshot(
+        ticker=ticker.upper(),
+        latest_close=latest,
+        sma200=sma,
+        pct_above_sma=(latest / sma - 1.0) * 100.0,
+        rsi14=_compute_rsi(closes),
+    )
+
+
+async def get_technical_snapshot(ticker: str, sma_days: int = 200) -> TechnicalSnapshot | None:
+    """Single-fetch snapshot: latest close, N-day SMA + extension, and RSI(14).
+    Used by the technical_exhaustion Devil's Advocate detector. Shares the
+    global yfinance cooldown / semaphore guard.
+    """
+    if _is_in_cooldown():
+        return None
+    async with _yfinance_semaphore:
+        try:
+            return await asyncio.to_thread(_compute_technical_snapshot_sync, ticker.upper(), sma_days)
+        except _RateLimited:
+            _trigger_cooldown()
+            return None
