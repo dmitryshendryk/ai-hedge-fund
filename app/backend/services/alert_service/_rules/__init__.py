@@ -9,10 +9,14 @@ from . import (
     csuite_buy,
     earnings_sentiment_shift,
     high_confluence,
+    insider_dumping,
     insider_sell_cluster_rule,
     new_spinoff,
     score_movement,
+    sector_rotation_rule,
     squeeze,
+    technical_breakdown,
+    whale_exit,
 )
 from app.backend.services.alert_service._types import AlertCandidate
 
@@ -49,6 +53,14 @@ def _score_movement_thresholds(settings: dict) -> dict:
     }
 
 
+def _sector_rotation_thresholds(settings: dict) -> dict:
+    return {
+        "smh_max_pct": float(settings.get("sector_rotation_smh_max_pct", -2.0)),
+        "iwm_min_pct": float(settings.get("sector_rotation_iwm_min_pct", 1.0)),
+        "lookback_days": int(settings.get("sector_rotation_lookback_days", 3)),
+    }
+
+
 # Each entry: (rule_type, evaluator function, thresholds extractor)
 RULES: list[tuple[str, RuleFn, Callable[[dict], dict]]] = [
     ("squeeze", squeeze.evaluate, _squeeze_thresholds_from_settings),
@@ -61,6 +73,10 @@ RULES: list[tuple[str, RuleFn, Callable[[dict], dict]]] = [
     ("score_movement", score_movement.evaluate, _score_movement_thresholds),
     ("high_confluence", high_confluence.evaluate, _high_confluence_thresholds),
     ("insider_sell_cluster", insider_sell_cluster_rule.evaluate, lambda _s: {}),
+    ("insider_dumping", insider_dumping.evaluate, lambda _s: {}),
+    ("technical_breakdown", technical_breakdown.evaluate, lambda _s: {}),
+    ("whale_exit", whale_exit.evaluate, lambda _s: {}),
+    ("sector_rotation", sector_rotation_rule.evaluate, _sector_rotation_thresholds),
 ]
 
 
