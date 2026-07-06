@@ -51,3 +51,15 @@ async def test_no_fire_when_pricing_unavailable():
     with patch.object(rot, "compute_alpha", _compute_mock({})):  # both None
         out = await rot.evaluate(_thresholds())
     assert out == []
+
+
+@pytest.mark.asyncio
+async def test_names_at_risk_holdings_in_message_and_payload():
+    with patch.object(rot, "compute_alpha", _compute_mock({"SMH": -2.4, "IWM": 1.8})), \
+         patch.object(rot, "_at_risk_holdings", AsyncMock(return_value=["ASML", "MU"])):
+        out = await rot.evaluate(_thresholds())
+    assert len(out) == 1
+    assert "ASML" in out[0].message and "MU" in out[0].message
+    assert "EXIT WATCH" in out[0].message
+    assert out[0].payload["at_risk_holdings"] == ["ASML", "MU"]
+
