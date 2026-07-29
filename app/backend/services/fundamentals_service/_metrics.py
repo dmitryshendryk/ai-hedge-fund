@@ -29,6 +29,7 @@ class CompanyMetrics:
     # Display
     long_name: str | None = None
     sector: str | None = None
+    industry: str | None = None
     # Quality
     return_on_equity: float | None = None
     return_on_assets: float | None = None
@@ -98,6 +99,7 @@ def _build_metrics_from_info(ticker: str, info: dict, ticker_obj: yf.Ticker | No
         ticker=ticker.upper(),
         long_name=(info.get("longName") or info.get("shortName") or None),
         sector=(info.get("sector") or None),
+        industry=(info.get("industry") or None),
         return_on_equity=safe_float(info.get("returnOnEquity")),
         return_on_assets=safe_float(info.get("returnOnAssets")),
         debt_to_equity=safe_float(info.get("debtToEquity")),
