@@ -33,8 +33,10 @@ _SECTOR_WARN_PCT: float = 35.0
 _SECTOR_CRITICAL_PCT: float = 50.0
 _INDUSTRY_WARN_PCT: float = 25.0
 _INDUSTRY_CRITICAL_PCT: float = 40.0
-_POSITION_WARN_PCT: float = 20.0
-_POSITION_CRITICAL_PCT: float = 30.0
+# Above equal weight for a five-name book (20%), which is diversified and must
+# not warn — a single-name flag has to mean the position is genuinely oversized.
+_POSITION_WARN_PCT: float = 25.0
+_POSITION_CRITICAL_PCT: float = 35.0
 
 _UNCLASSIFIED = "Unclassified"
 

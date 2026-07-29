@@ -92,6 +92,21 @@ def test_diversified_book_trips_no_critical_bucket():
     assert result.unclassified_pct == 40.0
 
 
+def test_equal_weight_five_name_book_raises_no_warning_at_all():
+    # Equal weight across five names is diversification. Warning on it would
+    # train the reader to ignore warnings, so the guard must stay silent.
+    items = [_pos(t, 4000.0) for t in ("QQQ", "VTI", "LLY", "META", "NVDA")]
+    metrics = {
+        "QQQ": _Metrics(),
+        "VTI": _Metrics(),
+        "LLY": _Metrics("Healthcare", "Drug Manufacturers - General"),
+        "META": _Metrics("Communication Services", "Internet Content & Information"),
+        "NVDA": _Metrics("Technology", "Semiconductors"),
+    }
+
+    assert compute_concentration(items, metrics).warnings == []
+
+
 def test_unclassified_bucket_is_never_tiered():
     # A 100% index-fund book is not a concentrated factor bet.
     items = [_pos("VTI", 5000.0), _pos("QQQ", 5000.0)]
