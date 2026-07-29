@@ -244,6 +244,24 @@ def compute_concentration(items: list[PositionResponse], metrics_by_ticker: dict
     )
 
 
+async def _safe_concentration(items: list[PositionResponse]) -> PortfolioConcentration | None:
+    """Concentration for the book, or None if fundamentals are unavailable.
+
+    Best-effort by design: the holdings list is the page's primary content and
+    must survive a fundamentals outage.
+    """
+    if not items:
+        return None
+    try:
+        from app.backend.services.fundamentals_service import get_company_metrics_batch
+
+        metrics_by_ticker = await get_company_metrics_batch([i.ticker for i in items])
+        return compute_concentration(items, metrics_by_ticker)
+    except Exception as exc:
+        logger.debug("positions: concentration unavailable: %s", exc)
+        return None
+
+
 def _entry_since(item: Position) -> date:
     if isinstance(item.entry_date, datetime):
         return item.entry_date.astimezone(timezone.utc).date() if item.entry_date.tzinfo else item.entry_date.date()
@@ -302,6 +320,7 @@ async def list_positions_enriched(db: Session) -> PositionListResponse:
             items=items,
             total=len(items),
             total_cost_value=total_cost_value,
+            concentration=await _safe_concentration(items),
         )
 
     total_pnl = total_market_value - priced_cost_value
@@ -313,4 +332,5 @@ async def list_positions_enriched(db: Session) -> PositionListResponse:
         total_market_value=round(total_market_value, 2),
         total_unrealized_pnl=round(total_pnl, 2),
         total_unrealized_pnl_pct=round(total_pnl_pct, 2) if total_pnl_pct is not None else None,
+        concentration=await _safe_concentration(items),
     )
