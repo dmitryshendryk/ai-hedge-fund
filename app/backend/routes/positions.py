@@ -7,6 +7,7 @@ from sqlalchemy.orm import Session
 
 from app.backend.database import get_db
 from app.backend.models.position_schemas import (
+    ConcentrationPreviewResponse,
     PositionAddRequest,
     PositionListResponse,
     PositionResponse,
@@ -15,6 +16,7 @@ from app.backend.models.position_schemas import (
 from app.backend.services.position_service import (
     add_position,
     list_positions_enriched,
+    preview_concentration,
     remove_position,
     update_position,
 )
@@ -27,6 +29,20 @@ router = APIRouter(prefix="/positions", tags=["positions"])
 @router.get("/", response_model=PositionListResponse)
 async def list_endpoint(db: Session = Depends(get_db)) -> PositionListResponse:
     return await list_positions_enriched(db)
+
+
+# Declared above the /{ticker} routes so "concentration" is never captured as
+# a ticker path parameter.
+@router.get("/concentration/preview", response_model=ConcentrationPreviewResponse)
+async def preview_endpoint(
+    ticker: str,
+    amount: float,
+    db: Session = Depends(get_db),
+) -> ConcentrationPreviewResponse:
+    try:
+        return await preview_concentration(db, ticker, amount)
+    except ValueError as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
 
 
 @router.post("/", response_model=PositionResponse)

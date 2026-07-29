@@ -15,6 +15,7 @@ from sqlalchemy.orm import Session
 from app.backend.database.models import Position
 from app.backend.models.position_schemas import (
     ConcentrationBucket,
+    ConcentrationPreviewResponse,
     PortfolioConcentration,
     PositionAddRequest,
     PositionListResponse,
@@ -333,4 +334,76 @@ async def list_positions_enriched(db: Session) -> PositionListResponse:
         total_unrealized_pnl=round(total_pnl, 2),
         total_unrealized_pnl_pct=round(total_pnl_pct, 2) if total_pnl_pct is not None else None,
         concentration=await _safe_concentration(items),
+    )
+
+
+def _weight_of(buckets: list[ConcentrationBucket], name: str | None) -> float:
+    if name is None:
+        return 0.0
+    return next((b.weight_pct for b in buckets if b.name == name), 0.0)
+
+
+def _synthetic_position(ticker: str, amount: float) -> PositionResponse:
+    """A hypothetical holding worth `amount`, priced at one notional share."""
+    return PositionResponse(
+        id=0,
+        ticker=ticker,
+        shares=1.0,
+        cost_basis=amount,
+        entry_date=datetime.now(timezone.utc).isoformat(),
+        cost_value=amount,
+        market_value=amount,
+    )
+
+
+async def preview_concentration(db: Session, ticker: str, amount: float) -> ConcentrationPreviewResponse:
+    """Concentration the book would have if `amount` of `ticker` were added.
+
+    Args:
+        ticker: Candidate symbol; classified via the same metrics batch as the
+            held names so an unknown symbol lands in Unclassified.
+        amount: Dollar value to hypothetically add. Must be positive.
+
+    Raises:
+        ValueError: Empty ticker or non-positive amount.
+    """
+    sym = (ticker or "").strip().upper()
+    if not sym:
+        raise ValueError("Ticker cannot be empty")
+    if amount <= 0:
+        raise ValueError("Amount must be positive")
+
+    from app.backend.services.fundamentals_service import get_company_metrics_batch
+
+    current = await list_positions_enriched(db)
+    held = list(current.items)
+    projected_items = [*held, _synthetic_position(sym, amount)]
+
+    metrics_by_ticker = await get_company_metrics_batch(sorted({i.ticker.upper() for i in projected_items}))
+    before = compute_concentration(held, metrics_by_ticker)
+    projected = compute_concentration(projected_items, metrics_by_ticker)
+
+    candidate = metrics_by_ticker.get(sym)
+    sector = (getattr(candidate, "sector", None) or "").strip() or None
+    industry = (getattr(candidate, "industry", None) or "").strip() or None
+
+    after_sector = _weight_of(projected.sectors, sector)
+    after_industry = _weight_of(projected.industries, industry)
+    resulting_tier = "ok"
+    for buckets, name in ((projected.sectors, sector), (projected.industries, industry)):
+        tier = next((b.tier for b in buckets if b.name == name), "ok")
+        if tier == "critical" or (tier == "warn" and resulting_tier == "ok"):
+            resulting_tier = tier
+
+    return ConcentrationPreviewResponse(
+        ticker=sym,
+        amount=round(amount, 2),
+        sector=sector,
+        industry=industry,
+        sector_weight_before_pct=_weight_of(before.sectors, sector) if before else 0.0,
+        sector_weight_after_pct=after_sector,
+        industry_weight_before_pct=_weight_of(before.industries, industry) if before else 0.0,
+        industry_weight_after_pct=after_industry,
+        resulting_tier=resulting_tier,
+        projected=projected,
     )

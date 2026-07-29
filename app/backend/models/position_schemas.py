@@ -84,6 +84,27 @@ class PositionListResponse(BaseModel):
     concentration: PortfolioConcentration | None = None
 
 
+class ConcentrationPreviewResponse(BaseModel):
+    """Projected concentration if `amount` of `ticker` were added to the book.
+
+    Reports before/after weights for the buckets the candidate lands in, so a
+    caller can state the marginal effect of a trade without first creating the
+    position. `sector` / `industry` are None when yfinance cannot classify the
+    ticker, in which case it lands in the untiered Unclassified bucket.
+    """
+
+    ticker: str
+    amount: float
+    sector: str | None
+    industry: str | None
+    sector_weight_before_pct: float
+    sector_weight_after_pct: float
+    industry_weight_before_pct: float
+    industry_weight_after_pct: float
+    resulting_tier: str  # worst tier the candidate's buckets reach after the add
+    projected: PortfolioConcentration
+
+
 class PositionAddRequest(BaseModel):
     ticker: str
     shares: float
