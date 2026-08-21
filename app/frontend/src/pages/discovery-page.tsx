@@ -64,9 +64,17 @@ function distinctSources(idea: DiscoveryIdea): number {
   return new Set(idea.signals.map((s) => s.source)).size;
 }
 
+const EXHAUSTION_THRESHOLD_PCT = 30;
+
+function isExhausted(idea: DiscoveryIdea): boolean {
+  return idea.pct_above_sma != null && idea.pct_above_sma > EXHAUSTION_THRESHOLD_PCT;
+}
+
 function confluenceTier(idea: DiscoveryIdea): ConfluenceTier {
   const sources = distinctSources(idea);
-  if (sources >= HIGH_CONFLUENCE_MIN_SOURCES && idea.score >= HIGH_CONFLUENCE_MIN_SCORE) {
+  // An extended name cannot reach the top tier however many signals agree: the
+  // move already happened, so confluence overstates what is left to capture.
+  if (sources >= HIGH_CONFLUENCE_MIN_SOURCES && idea.score >= HIGH_CONFLUENCE_MIN_SCORE && !isExhausted(idea)) {
     return {
       label: '🚨 SUPER-NOVA',
       className: 'border-destructive bg-destructive/20 text-destructive font-bold animate-pulse',
@@ -651,6 +659,14 @@ export function DiscoveryPage() {
                     </TableCell>
                     <TableCell className="font-data text-base text-right text-primary font-bold">
                       {Math.round(idea.score)}
+                      {idea.exhaustion_penalty > 0 && (
+                        <div
+                          className="text-[10px] font-normal text-destructive"
+                          title={`${idea.pct_above_sma?.toFixed(0)}% above its 200-day average — ${idea.exhaustion_penalty} points deducted and the top tier withheld`}
+                        >
+                          −{idea.exhaustion_penalty} exhausted
+                        </div>
+                      )}
                     </TableCell>
                     <TableCell className="text-right font-data text-xs">
                       {idea.return_30d_pct == null ? (

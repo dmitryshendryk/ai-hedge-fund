@@ -25,6 +25,8 @@ class DiscoveryIdea(BaseModel):
     return_30d_pct: float | None = None
     alpha_30d_pct: float | None = None
     distance_from_whale_entry_pct: float | None = None
+    pct_above_sma: float | None = None  # percent, not a fraction; None when unpriceable
+    exhaustion_penalty: float = 0.0  # points already subtracted from score
 
 
 class SectorBreakdown(BaseModel):

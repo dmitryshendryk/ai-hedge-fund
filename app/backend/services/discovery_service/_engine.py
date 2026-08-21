@@ -11,12 +11,31 @@ import asyncio
 import logging
 import math
 from collections import defaultdict
+from dataclasses import dataclass
 from datetime import date, datetime
 
 from app.backend.models.discovery_schemas import DiscoveryIdea, IdeaSignal
 from app.backend.services.discovery_service._sources import SOURCES
+from app.backend.services.macro_service import MacroRegime, get_regime
+from app.backend.services.pricing_service import get_technical_snapshot
 
 logger = logging.getLogger(__name__)
+
+
+# Entry-quality gate. A name far above its 200-day average has already made its
+# move, so signal confluence alone overstates the opportunity. Percent units,
+# matching TechnicalSnapshot.pct_above_sma — 30.0 means 30%, not 0.30.
+_EXHAUSTION_THRESHOLD_PCT: float = 30.0
+_EXHAUSTION_PENALTY: float = 30.0
+_EXHAUSTION_MAX_CHECK: int = 100
+_EXHAUSTION_CONCURRENCY: int = 8
+
+
+@dataclass(frozen=True)
+class AggregatedDiscovery:
+    """Engine output: scored/sorted ideas plus the macro regime that gated them."""
+    ideas: list[DiscoveryIdea]
+    regime: MacroRegime
 
 _DECAY_HALF_LIFE_DAYS = 45.0
 _DECAY_FLOOR = 0.1
@@ -89,7 +108,52 @@ def _apply_decay(signal: IdeaSignal) -> IdeaSignal:
     )
 
 
-async def aggregate_ideas() -> list[DiscoveryIdea]:
+async def apply_exhaustion_penalty(ideas: list[DiscoveryIdea], max_check: int | None = None) -> None:
+    """Subtract the exhaustion penalty from extended names, then re-sort in place.
+
+    Args:
+        ideas: Ranked ideas, highest score first. Mutated.
+        max_check: How many top ideas to price. One fetch per name over a
+            multi-thousand-name universe is not affordable, so the tail keeps
+            its score. Defaults to the module cap.
+
+    A ticker with no snapshot keeps its score: absent evidence is not evidence
+    of exhaustion. CIK-only spin-off entities have no price series and are
+    skipped without a fetch.
+    """
+    limit = _EXHAUSTION_MAX_CHECK if max_check is None else max_check
+    candidates = [i for i in ideas[:limit] if i.is_ticker]
+    if not candidates:
+        return
+
+    semaphore = asyncio.Semaphore(_EXHAUSTION_CONCURRENCY)
+
+    async def _snapshot(idea: DiscoveryIdea):
+        async with semaphore:
+            return await get_technical_snapshot(idea.ticker)
+
+    results = await asyncio.gather(*(_snapshot(i) for i in candidates), return_exceptions=True)
+
+    penalized = 0
+    for idea, result in zip(candidates, results, strict=True):
+        if isinstance(result, BaseException) or result is None:
+            continue
+        pct = result.pct_above_sma
+        if pct is None:
+            continue
+        idea.pct_above_sma = round(pct, 2)
+        if pct > _EXHAUSTION_THRESHOLD_PCT:
+            idea.exhaustion_penalty = _EXHAUSTION_PENALTY
+            idea.score = round(max(0.0, idea.score - _EXHAUSTION_PENALTY), 2)
+            penalized += 1
+
+    if penalized:
+        # Re-rank so a penalized leader loses its place to a non-extended peer.
+        ideas.sort(key=lambda i: -i.score)
+    logger.info("exhaustion penalty: checked %d, penalized %d", len(candidates), penalized)
+
+
+async def aggregate_ideas() -> AggregatedDiscovery:
     # Partial-success fanout: one source failing must not cancel the others.
     # This is the documented exception case for gather(return_exceptions=True);
     # TaskGroup's all-or-nothing semantics would lose 18 sources' work on
@@ -100,8 +164,12 @@ async def aggregate_ideas() -> list[DiscoveryIdea]:
         async with sem:
             return await fn()
 
+    # Macro regime fetched in parallel with source fanout — FRED is fast
+    # (1h cached) but no reason to serialize it.
+    regime_task = asyncio.create_task(get_regime())
     tasks = [_gated(src) for _, src in SOURCES]
     results = await asyncio.gather(*tasks, return_exceptions=True)
+    regime = await regime_task
 
     by_key: dict[str, list[IdeaSignal]] = defaultdict(list)
     for (source_name, _), result in zip(SOURCES, results):
@@ -147,10 +215,11 @@ async def aggregate_ideas() -> list[DiscoveryIdea]:
             ticker=ticker_or_cik,
             company=company,
             cik=cik,
-            score=sum(s.score for s in signals),
+            score=round(sum(s.score for s in signals) * regime.score_multiplier, 2),
             signals=sorted(signals, key=lambda s: -s.score),
             is_ticker=is_ticker,
         ))
 
     ideas.sort(key=lambda i: -i.score)
-    return ideas
+    await apply_exhaustion_penalty(ideas)
+    return AggregatedDiscovery(ideas=ideas, regime=regime)

@@ -19,6 +19,8 @@ export interface DiscoveryIdea {
   return_30d_pct: number | null;
   alpha_30d_pct: number | null;
   distance_from_whale_entry_pct: number | null;
+  pct_above_sma: number | null;
+  exhaustion_penalty: number;
 }
 
 export interface SectorBreakdown {
