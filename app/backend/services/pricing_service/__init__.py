@@ -424,3 +424,154 @@ async def get_technical_snapshot(ticker: str, sma_days: int = 200) -> TechnicalS
         except _RateLimited:
             _trigger_cooldown()
             return None
+
+
+# Stop distance as a multiple of ATR. 1.5x sits outside normal daily noise, so a
+# touch signals the move failed rather than that the name simply wobbled.
+_SIZING_STOP_MULTIPLE: float = 1.5
+_ATR_PERIOD: int = 14
+
+
+def _compute_atr(history: "pd.DataFrame", period: int = _ATR_PERIOD) -> float | None:
+    """Wilder's Average True Range over an OHLC frame.
+
+    True range spans the prior close, so an overnight gap counts as volatility
+    instead of hiding behind a narrow intraday spread.
+
+    Returns:
+        None when High/Low/Close are absent or fewer than period+1 bars remain.
+    """
+    required = ("High", "Low", "Close")
+    if history is None or any(col not in history.columns for col in required):
+        return None
+    frame = history.dropna(subset=list(required))
+    if len(frame) < period + 1:
+        return None
+
+    high = frame["High"]
+    low = frame["Low"]
+    prev_close = frame["Close"].shift(1)
+    true_range = pd.concat(
+        [high - low, (high - prev_close).abs(), (low - prev_close).abs()],
+        axis=1,
+    ).max(axis=1).dropna()
+    if len(true_range) < period:
+        return None
+
+    atr = float(true_range.ewm(alpha=1.0 / period, adjust=False).mean().iloc[-1])
+    return atr if math.isfinite(atr) and atr >= 0 else None
+
+
+@dataclass
+class AtrSnapshot:
+    """Latest close plus ATR, for sizing and stop placement."""
+    ticker: str
+    latest_close: float
+    atr: float
+    atr_pct_of_price: float  # daily range as a share of price
+
+
+def _compute_atr_sync(ticker: str, period: int) -> AtrSnapshot | None:
+    end = date.today() + timedelta(days=1)
+    start = end - timedelta(days=period * 6 + 30)
+    try:
+        history = yf.Ticker(ticker).history(start=start, end=end, auto_adjust=True)
+    except Exception as exc:
+        msg = str(exc)
+        if _is_rate_limit_message(msg):
+            raise _RateLimited(msg) from exc
+        logger.warning("pricing_service ATR failed for %s: %s", ticker, exc)
+        return None
+    if history is None or history.empty:
+        return None
+
+    atr = _compute_atr(history, period)
+    if atr is None or atr <= 0:
+        return None
+    try:
+        latest = float(history["Close"].dropna().iloc[-1])
+    except (KeyError, IndexError, ValueError, TypeError):
+        return None
+    if not math.isfinite(latest) or latest <= 0:
+        return None
+
+    return AtrSnapshot(
+        ticker=ticker.upper(),
+        latest_close=latest,
+        atr=atr,
+        atr_pct_of_price=atr / latest * 100.0,
+    )
+
+
+async def get_atr(ticker: str, period: int = _ATR_PERIOD) -> AtrSnapshot | None:
+    """ATR read sharing the global yfinance cooldown / semaphore guard."""
+    if _is_in_cooldown():
+        return None
+    async with _yfinance_semaphore:
+        try:
+            return await asyncio.to_thread(_compute_atr_sync, ticker.upper(), period)
+        except _RateLimited:
+            _trigger_cooldown()
+            return None
+
+
+@dataclass
+class PositionSizing:
+    """How many shares a fixed dollar risk permits at a name's volatility.
+
+    `shares` answers the risk question alone and can exceed the account for a
+    low-volatility name, so `capped_shares` also respects available capital and
+    `capped_by` names the binding constraint.
+    """
+    shares: int
+    risk_amount: float
+    stop_distance: float
+    stop_multiple: float
+    position_value: float | None
+    position_pct_of_account: float | None
+    capped_shares: int
+    capped_by: str  # "risk" | "capital"
+
+
+def suggest_position_size(
+    account_value: float,
+    risk_pct: float,
+    atr: float,
+    price: float | None = None,
+    stop_multiple: float = _SIZING_STOP_MULTIPLE,
+) -> PositionSizing:
+    """Shares permitted by a fixed dollar risk at the name's daily range.
+
+    Args:
+        risk_pct: Fraction of the account to risk, e.g. 0.02 for 2%.
+        atr: Average True Range in currency units, not percent.
+        price: Latest close, supplied only to report the resulting exposure.
+
+    Returns:
+        shares rounded down, so the risk budget is never exceeded.
+
+    Raises:
+        ValueError: account_value not positive, or risk_pct outside (0, 1].
+    """
+    if account_value <= 0:
+        raise ValueError("Account value must be positive")
+    if not 0 < risk_pct <= 1:
+        raise ValueError("Risk percent must be between 0 and 1")
+
+    risk_amount = account_value * risk_pct
+    stop_distance = stop_multiple * atr
+    shares = int(risk_amount // stop_distance) if stop_distance > 0 else 0
+
+    position_value = shares * price if price is not None else None
+    affordable = int(account_value // price) if price is not None and price > 0 else shares
+    capped_shares = min(shares, affordable)
+    return PositionSizing(
+        shares=shares,
+        risk_amount=round(risk_amount, 2),
+        stop_distance=round(stop_distance, 4),
+        stop_multiple=stop_multiple,
+        position_value=round(position_value, 2) if position_value is not None else None,
+        position_pct_of_account=round(position_value / account_value * 100.0, 2) if position_value is not None else None,
+        capped_shares=capped_shares,
+        capped_by="capital" if capped_shares < shares else "risk",
+    )
