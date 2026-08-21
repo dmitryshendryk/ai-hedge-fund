@@ -260,6 +260,7 @@ export function PositionsPage() {
               <TableHead className="uppercase text-xs tracking-wider text-right">Price</TableHead>
               <TableHead className="uppercase text-xs tracking-wider text-right">Market Value</TableHead>
               <TableHead className="uppercase text-xs tracking-wider text-right">Unrealized P&amp;L</TableHead>
+              <TableHead className="uppercase text-xs tracking-wider text-right">Stop</TableHead>
               <TableHead className="uppercase text-xs tracking-wider text-right">vs SPY</TableHead>
               <TableHead className="uppercase text-xs tracking-wider w-12" />
             </TableRow>
@@ -296,6 +297,32 @@ export function PositionsPage() {
                       <div className="flex flex-col items-end">
                         <span className={cn('font-semibold', pctClass(p.unrealized_pnl))}>{money(p.unrealized_pnl)}</span>
                         <span className={cn('text-[10px]', pctClass(p.unrealized_pnl_pct))}>{signedPct(p.unrealized_pnl_pct)}</span>
+                      </div>
+                    )}
+                  </TableCell>
+                  <TableCell className="text-right font-data text-xs">
+                    {p.stop_loss_price == null ? (
+                      <span className="text-muted-foreground" title="No price history, so no stop was set">—</span>
+                    ) : (
+                      <div
+                        className="flex flex-col items-end"
+                        title={`${p.stop_multiple}x ATR (${p.stop_atr?.toFixed(2)}) below your cost basis. Below this level the technical trade is invalid.`}
+                      >
+                        <span className="font-semibold">{money(p.stop_loss_price)}</span>
+                        {p.distance_to_stop_pct != null && (
+                          <span
+                            className={cn(
+                              'text-[10px]',
+                              p.distance_to_stop_pct <= 0
+                                ? 'text-destructive font-semibold'
+                                : p.distance_to_stop_pct < 5
+                                  ? 'text-amber-400'
+                                  : 'text-muted-foreground',
+                            )}
+                          >
+                            {p.distance_to_stop_pct <= 0 ? 'BREACHED' : `${p.distance_to_stop_pct.toFixed(1)}% away`}
+                          </span>
+                        )}
                       </div>
                     )}
                   </TableCell>

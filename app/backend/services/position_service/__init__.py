@@ -40,6 +40,58 @@ _POSITION_CRITICAL_PCT: float = 35.0
 
 _UNCLASSIFIED = "Unclassified"
 
+# Stop distance as a multiple of ATR. 2x sits clear of ordinary daily noise, so
+# a touch means the trade thesis failed rather than that the name wobbled.
+_STOP_ATR_MULTIPLE: float = 2.0
+
+
+def compute_stop_loss(cost_basis: float, atr: float | None, multiple: float = _STOP_ATR_MULTIPLE) -> float | None:
+    """Exit level `multiple` ATR below entry, floored at zero.
+
+    Args:
+        atr: Average True Range in currency units.
+
+    Returns:
+        None when ATR is missing or not positive. A guessed stop is worse than
+        none, so no fallback is invented.
+    """
+    if atr is None or atr <= 0:
+        return None
+    return round(max(0.0, cost_basis - multiple * atr), 2)
+
+
+async def add_position_with_stop(db: Session, req: PositionAddRequest) -> PositionResponse:
+    """Add a position and store the stop level its volatility implies.
+
+    The stop is derived from the saved cost basis, so re-adding a ticker moves
+    the stop to the blended basis. ATR trouble never blocks the add: the
+    position saves with no stop.
+    """
+    saved = add_position(db, req)
+
+    atr: float | None = None
+    try:
+        from app.backend.services.pricing_service import get_atr
+
+        snapshot = await get_atr(saved.ticker)
+        atr = snapshot.atr if snapshot is not None else None
+    except Exception as exc:
+        logger.debug("positions: ATR unavailable for %s: %s", saved.ticker, exc)
+
+    stop = compute_stop_loss(saved.cost_basis, atr)
+    if stop is None:
+        return saved
+
+    row = db.query(Position).filter(Position.ticker == saved.ticker).first()
+    if row is not None:
+        row.stop_loss_price = stop
+        row.stop_atr = round(atr, 4) if atr is not None else None
+        row.stop_multiple = _STOP_ATR_MULTIPLE
+        db.commit()
+        db.refresh(row)
+        return _base_response(row)
+    return saved
+
 
 def _iso(value: datetime | None) -> str:
     return value.isoformat() if isinstance(value, datetime) else str(value or "")
@@ -65,6 +117,9 @@ def _base_response(item: Position) -> PositionResponse:
         entry_date=_iso(item.entry_date),
         notes=item.notes,
         cost_value=round(item.shares * item.cost_basis, 2),
+        stop_loss_price=item.stop_loss_price,
+        stop_atr=item.stop_atr,
+        stop_multiple=item.stop_multiple,
     )
 
 
@@ -314,6 +369,9 @@ async def list_positions_enriched(db: Session) -> PositionListResponse:
         target.return_since_entry_pct = round(metrics.period_return_pct, 2)
         target.alpha_pct_vs_spy = round(metrics.alpha_pct, 2)
         target.price_as_of = metrics.end_date
+        if target.stop_loss_price is not None and price > 0:
+            # Negative once price sits below the stop, which reads as breached.
+            target.distance_to_stop_pct = round((price - target.stop_loss_price) / price * 100.0, 2)
 
         total_market_value += market_value
         priced_cost_value += cost_value

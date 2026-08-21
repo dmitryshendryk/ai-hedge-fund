@@ -15,6 +15,7 @@ from app.backend.models.position_schemas import (
 )
 from app.backend.services.position_service import (
     add_position,
+    add_position_with_stop,
     list_positions_enriched,
     preview_concentration,
     remove_position,
@@ -46,9 +47,9 @@ async def preview_endpoint(
 
 
 @router.post("/", response_model=PositionResponse)
-def add_endpoint(req: PositionAddRequest, db: Session = Depends(get_db)) -> PositionResponse:
+async def add_endpoint(req: PositionAddRequest, db: Session = Depends(get_db)) -> PositionResponse:
     try:
-        return add_position(db, req)
+        return await add_position_with_stop(db, req)
     except ValueError as exc:
         raise HTTPException(status_code=400, detail=str(exc)) from exc
 

@@ -276,6 +276,12 @@ class Position(Base):
     cost_basis = Column(Float, nullable=False)  # average cost per share
     entry_date = Column(DateTime(timezone=True), server_default=func.now(), nullable=False)
     notes = Column(Text, nullable=True)
+    # Exit level fixed at entry, so the decision is made before the position
+    # moves. Nullable: ATR is unavailable for a name yfinance cannot price, and
+    # a guessed stop is worse than none.
+    stop_loss_price = Column(Float, nullable=True)
+    stop_atr = Column(Float, nullable=True)
+    stop_multiple = Column(Float, nullable=True)
     created_at = Column(DateTime(timezone=True), server_default=func.now())
     updated_at = Column(DateTime(timezone=True), onupdate=func.now())
 

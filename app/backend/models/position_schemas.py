@@ -23,6 +23,13 @@ class PositionResponse(BaseModel):
     notes: str | None = None
     cost_value: float  # shares * cost_basis
 
+    # Exit level fixed at entry. None when ATR was unavailable, or for a
+    # position added before stops were stored.
+    stop_loss_price: float | None = None
+    stop_atr: float | None = None
+    stop_multiple: float | None = None
+    distance_to_stop_pct: float | None = None  # from current price; negative once breached
+
     current_price: float | None = None
     market_value: float | None = None
     unrealized_pnl: float | None = None

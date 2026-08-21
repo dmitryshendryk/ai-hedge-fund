@@ -15,6 +15,10 @@ export interface Position {
   return_since_entry_pct: number | null;
   alpha_pct_vs_spy: number | null;
   price_as_of: string | null;
+  stop_loss_price: number | null;
+  stop_atr: number | null;
+  stop_multiple: number | null;
+  distance_to_stop_pct: number | null;
 }
 
 export interface ConcentrationBucket {
