@@ -8,6 +8,7 @@ from dataclasses import dataclass
 
 import yfinance as yf
 
+from ._advanced import ev_to_fcf, rule_of_40
 from ._helpers import (
     CACHE_MAX_SIZE,
     CACHE_TTL_SECONDS,
@@ -42,6 +43,12 @@ class CompanyMetrics:
     peg_ratio: float | None = None
     price_to_book: float | None = None
     target_mean_price: float | None = None
+    enterprise_value: float | None = None
+    ev_to_fcf: float | None = None  # EV per dollar of FCF; None when FCF <= 0
+    # Growth
+    revenue_growth_pct: float | None = None
+    ebitda_margin_pct: float | None = None
+    rule_of_40: float | None = None  # growth + margin; below 40 the burn outpaces growth
     # Cash generation
     free_cash_flow: float | None = None
     market_cap: float | None = None
@@ -95,6 +102,14 @@ def _build_metrics_from_info(ticker: str, info: dict, ticker_obj: yf.Ticker | No
     if ticker_obj is not None:
         dividend_years = consecutive_dividend_growth_years(ticker_obj)
 
+    # yfinance reports growth and margin as fractions; the Rule of 40 sums
+    # percentages.
+    revenue_growth = safe_float(info.get("revenueGrowth"))
+    ebitda_margin = safe_float(info.get("ebitdaMargins"))
+    revenue_growth_pct = revenue_growth * 100.0 if revenue_growth is not None else None
+    ebitda_margin_pct = ebitda_margin * 100.0 if ebitda_margin is not None else None
+    enterprise_value = safe_float(info.get("enterpriseValue"))
+
     metrics = CompanyMetrics(
         ticker=ticker.upper(),
         long_name=(info.get("longName") or info.get("shortName") or None),
@@ -110,6 +125,11 @@ def _build_metrics_from_info(ticker: str, info: dict, ticker_obj: yf.Ticker | No
         peg_ratio=safe_float(info.get("trailingPegRatio") or info.get("pegRatio")),
         price_to_book=safe_float(info.get("priceToBook")),
         target_mean_price=safe_float(info.get("targetMeanPrice")),
+        enterprise_value=enterprise_value,
+        ev_to_fcf=ev_to_fcf(enterprise_value=enterprise_value, free_cash_flow=fcf),
+        revenue_growth_pct=round(revenue_growth_pct, 2) if revenue_growth_pct is not None else None,
+        ebitda_margin_pct=round(ebitda_margin_pct, 2) if ebitda_margin_pct is not None else None,
+        rule_of_40=rule_of_40(revenue_growth_pct=revenue_growth_pct, ebitda_margin_pct=ebitda_margin_pct),
         free_cash_flow=fcf,
         market_cap=market_cap,
         fcf_yield=fcf_yield,
