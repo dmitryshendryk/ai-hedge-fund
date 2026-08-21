@@ -67,7 +67,7 @@ _BASE_PARAMS: dict[str, str] = {
     "och": "",     # ownership change % high
     "session": "", # session
     "isc": "1",    # insider count minimum
-    "cnt": "100",  # results count
+    "cnt": "500",  # results count (bumped from 100 — broadens Discovery universe ~5x)
     "sortcol": "0",
     "sortdir": "1",
 }
@@ -115,7 +115,7 @@ PRESET_CONFIGS: dict[str, dict[str, str]] = {
         "fd": "30",
         "xp": "1", "xs": "1",  # purchases + sales
         "vl": "100",
-        "cnt": "100",
+        "cnt": "500",
     },
     # Cluster Buy: purchases > $25k, last 90 days, 3+ insiders
     "cluster_buy": {
@@ -123,7 +123,7 @@ PRESET_CONFIGS: dict[str, dict[str, str]] = {
         "xp": "1",  # purchases only
         "vl": "25",
         "isc": "3",
-        "cnt": "100",
+        "cnt": "500",
     },
     # Cluster Sell: sales > $25k, last 90 days, 3+ insiders
     "cluster_sell": {
@@ -131,20 +131,20 @@ PRESET_CONFIGS: dict[str, dict[str, str]] = {
         "xs": "1",  # sales only
         "vl": "25",
         "isc": "3",
-        "cnt": "100",
+        "cnt": "500",
     },
     # Significant Increase: purchases, >20% ownership change, last 90 days
     "significant_increase": {
         "fd": "90",
         "xp": "1",  # purchases only
         "ocl": "20",
-        "cnt": "100",
+        "cnt": "500",
     },
     # Screener: all trades (buys + sells), last 30 days
     "screener": {
         "fd": "30",
         "xp": "1", "xs": "1",  # purchases + sales
-        "cnt": "100",
+        "cnt": "500",
     },
 }
 
@@ -232,10 +232,23 @@ class OpenInsiderFetchError(Exception):
 
 
 def build_screener_url(preset: str, custom_params: dict[str, str] | None) -> str:
-    """Construct the openinsider.com URL. Uses direct "Latest" URLs for named presets."""
+    """Build the openinsider.com URL for a preset or a custom query.
+
+    A preset in PRESET_CONFIGS becomes a screener form submission so its filters
+    reach the site; the bare category URL drops them silently. A latest_* or
+    top_* preset has no screener equivalent and keeps its curated URL.
+    """
+    config = PRESET_CONFIGS.get(preset)
+    if config is not None:
+        params = dict(_BASE_PARAMS)
+        params.update(config)
+        return f"{_BASE_URL}?{urlencode(params)}"
+
     direct = _PRESET_DIRECT_URLS.get(preset)
     if direct:
-        return direct
+        # Category pages default to ~100 rows; cnt widens the Form 4 stream.
+        return f"{direct}?cnt=500"
+
     params = dict(_BASE_PARAMS)
     params.update(_translate_custom_params(custom_params or {}))
     return f"{_BASE_URL}?{urlencode(params)}"
