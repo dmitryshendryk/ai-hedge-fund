@@ -16,13 +16,47 @@ class TranscriptFetchResult:
     source: str
 
 
-def fetch_transcripts_edgar(ticker: str, limit: int = 2) -> list[dict]:
+def _as_filing_list(latest: object) -> list:
+    """Normalise an edgar `.latest()` result to a list.
+
+    Args:
+        latest: None when the company filed nothing of that form, a bare Filing
+            when one matched, or a collection when several did.
+
+    Returns:
+        A list. A string or other scalar is wrapped rather than iterated, since
+        iterating a string would yield characters.
+    """
+    if latest is None:
+        return []
+    if isinstance(latest, list):
+        return latest
+    if isinstance(latest, (str, bytes)):
+        return [latest]
+    try:
+        return list(latest)
+    except TypeError:
+        return [latest]
+
+
+def _latest_8k_filings(ticker: str, count: int = 20) -> list:
+    """Recent 8-K filings for a ticker, newest first, or [] when none exist."""
     from app.backend.services.insider_service._helpers import _ensure_identity
     _ensure_identity()
 
     from edgar import Company
-    company = Company(ticker.upper())
-    filings = company.get_filings(form="8-K").latest(20)
+
+    try:
+        filings = Company(ticker.upper()).get_filings(form="8-K")
+        latest = filings.latest(count) if filings is not None else None
+    except Exception as exc:
+        raise EarningsFetchError(f"EDGAR lookup failed for {ticker}: {exc}") from exc
+
+    return _as_filing_list(latest)
+
+
+def fetch_transcripts_edgar(ticker: str, limit: int = 2) -> list[dict]:
+    filings = _latest_8k_filings(ticker)
 
     results = []
     for filing in filings:

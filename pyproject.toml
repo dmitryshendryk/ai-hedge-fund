@@ -10,7 +10,10 @@ packages = [
 ]
 
 [tool.poetry.dependencies]
-python = "^3.11"
+# Upper bound tracks financetoolkit, which caps at <3.16. Narrowing the whole
+# project rather than marking that one dependency keeps a 3.16 interpreter
+# failing at install instead of at import.
+python = ">=3.11,<3.16"
 langchain = "^0.3.7"
 langchain-anthropic = "0.3.5"
 langchain-groq = "0.2.3"
@@ -37,10 +40,11 @@ langchain-gigachat = "^0.3.12"
 langchain-xai = "^0.2.5"
 crawl4ai = ">=0.4.0"
 finvizfinance = "^1.3.0"
-yfinance = "^1.2.0"
 edgartools = "^5.27.0"
 beautifulsoup4 = "^4.12.0"
 openbb = "^4.7.1"
+yfinance = "^1.4"
+financetoolkit = "~2.1.4"
 
 [tool.poetry.group.dev.dependencies]
 pytest = "^7.4.0"
