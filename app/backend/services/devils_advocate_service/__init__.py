@@ -28,8 +28,10 @@ from app.backend.services.devils_advocate_service._exhausted_analyst import (
     detect_exhausted_analyst,
 )
 from app.backend.services.devils_advocate_service._forensic_ratios import (
+    detect_dupont_leverage_trap,
     detect_interest_coverage,
     detect_montier_c_score,
+    detect_piotroski_distress,
 )
 from app.backend.services.devils_advocate_service._schemas import (
     RedFlagFinding,
@@ -115,6 +117,8 @@ async def get_red_flags(ticker: str) -> RedFlagReport:
         detect_exhausted_analyst(sym),
         detect_montier_c_score(sym),
         detect_interest_coverage(sym),
+        detect_piotroski_distress(sym),
+        detect_dupont_leverage_trap(sym),
         return_exceptions=True,
     )
 

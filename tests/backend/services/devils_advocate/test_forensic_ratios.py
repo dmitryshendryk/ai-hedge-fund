@@ -11,8 +11,10 @@ import pytest
 
 from app.backend.services.devils_advocate_service import _forensic_ratios
 from app.backend.services.devils_advocate_service._forensic_ratios import (
+    detect_dupont_leverage_trap,
     detect_interest_coverage,
     detect_montier_c_score,
+    detect_piotroski_distress,
 )
 from app.backend.services.devils_advocate_service._schemas import Severity
 from app.backend.services.devils_advocate_service._yfinance_fundamentals import ForensicBundle
@@ -147,3 +149,88 @@ class TestInterestCoverageDetector:
     async def test_fetch_failure_is_swallowed(self):
         with patch.object(_forensic_ratios, "get_forensic_bundle", AsyncMock(side_effect=RuntimeError("down"))):
             assert await detect_interest_coverage("TEST") == []
+
+
+class TestPiotroskiDistressDetector:
+    def _bundle_for(self, net_income: float, cash_flow: float) -> ForensicBundle:
+        return _bundle(
+            balance={
+                "Total Assets": [1_000.0, 1_000.0],
+                "Long Term Debt": [400.0, 200.0],
+                "Current Assets": [300.0, 400.0],
+                "Current Liabilities": [200.0, 200.0],
+                "Ordinary Shares Number": [130.0, 100.0],
+            },
+            income={
+                "Net Income": [net_income, 100.0],
+                "Total Revenue": [800.0, 1_000.0],
+                "Gross Profit": [200.0, 400.0],
+            },
+            cash={"Operating Cash Flow": [cash_flow, 150.0]},
+        )
+
+    @pytest.mark.asyncio
+    async def test_a_failing_business_raises_a_critical_flag(self):
+        with patch.object(_forensic_ratios, "get_forensic_bundle", AsyncMock(return_value=self._bundle_for(-50.0, -80.0))):
+            findings = await detect_piotroski_distress("TEST")
+
+        assert len(findings) == 1
+        assert findings[0].severity is Severity.CRITICAL
+        assert findings[0].detail["f_score"] == 0
+
+    @pytest.mark.asyncio
+    async def test_a_healthy_business_raises_nothing(self):
+        # A strong score is not a bear signal, so the detector stays silent.
+        bundle = _bundle(
+            balance={
+                "Total Assets": [1_000.0, 1_000.0],
+                "Long Term Debt": [100.0, 200.0],
+                "Current Assets": [600.0, 400.0],
+                "Current Liabilities": [200.0, 200.0],
+                "Ordinary Shares Number": [100.0, 100.0],
+            },
+            income={
+                "Net Income": [200.0, 100.0],
+                "Total Revenue": [1_200.0, 1_000.0],
+                "Gross Profit": [600.0, 400.0],
+            },
+            cash={"Operating Cash Flow": [300.0, 150.0]},
+        )
+        with patch.object(_forensic_ratios, "get_forensic_bundle", AsyncMock(return_value=bundle)):
+            assert await detect_piotroski_distress("TEST") == []
+
+    @pytest.mark.asyncio
+    async def test_fetch_failure_is_swallowed(self):
+        with patch.object(_forensic_ratios, "get_forensic_bundle", AsyncMock(side_effect=RuntimeError("down"))):
+            assert await detect_piotroski_distress("TEST") == []
+
+
+class TestDupontLeverageTrapDetector:
+    def _trap_bundle(self, net_income: float) -> ForensicBundle:
+        # Equity halves while assets hold, so the multiplier doubles.
+        return _bundle(
+            balance={"Total Assets": [1_000.0, 1_000.0], "Stockholders Equity": [400.0, 800.0]},
+            income={"Net Income": [net_income, 150.0], "Total Revenue": [1_000.0, 1_000.0]},
+            cash={"Operating Cash Flow": [100.0, 100.0]},
+        )
+
+    @pytest.mark.asyncio
+    async def test_leverage_driven_roe_raises_a_critical_flag(self):
+        with patch.object(_forensic_ratios, "get_forensic_bundle", AsyncMock(return_value=self._trap_bundle(120.0))):
+            findings = await detect_dupont_leverage_trap("TEST")
+
+        assert len(findings) == 1
+        assert findings[0].severity is Severity.CRITICAL
+        assert findings[0].detail["equity_multiplier"] > findings[0].detail["prior_equity_multiplier"]
+        assert findings[0].detail["net_profit_margin_pct"] < findings[0].detail["prior_net_profit_margin_pct"]
+
+    @pytest.mark.asyncio
+    async def test_improving_margins_raise_nothing(self):
+        # Same leverage increase, but the business is earning more per sale.
+        with patch.object(_forensic_ratios, "get_forensic_bundle", AsyncMock(return_value=self._trap_bundle(300.0))):
+            assert await detect_dupont_leverage_trap("TEST") == []
+
+    @pytest.mark.asyncio
+    async def test_fetch_failure_is_swallowed(self):
+        with patch.object(_forensic_ratios, "get_forensic_bundle", AsyncMock(side_effect=RuntimeError("down"))):
+            assert await detect_dupont_leverage_trap("TEST") == []
