@@ -14,6 +14,9 @@ dependency risk (analyst can't trigger sources that re-trigger analyst).
 
 import logging
 import os
+import time
+from collections import OrderedDict
+from enum import Enum
 
 import httpx
 
@@ -27,6 +30,41 @@ _FINNHUB_BASE = "https://finnhub.io/api/v1"
 _PLACEHOLDER_PREFIXES = ("your-", "placeholder", "change-me", "sk-xxx")
 _BIG_SHIFT = 3
 _MAX_TICKERS = 100
+
+# Finnhub publishes recommendations monthly, so a long TTL costs no freshness
+# while keeping a Discovery refresh off the request budget entirely.
+_CACHE_TTL_SECONDS = 6 * 60 * 60
+_CACHE_MAX_SIZE = 200
+
+
+class _Sentinel(Enum):
+    """Distinct from None, which is a legal cached value meaning the ticker has
+    no usable recommendation history. Caching it avoids re-asking Finnhub for a
+    symbol it does not cover.
+    """
+    MISS = "miss"
+
+
+_MISS = _Sentinel.MISS
+
+_cache: OrderedDict[str, tuple[int | None, float]] = OrderedDict()
+
+
+def _cache_get(ticker: str) -> int | None | _Sentinel:
+    entry = _cache.get(ticker)
+    if entry is None:
+        return _MISS
+    value, ts = entry
+    if time.monotonic() - ts > _CACHE_TTL_SECONDS:
+        _cache.pop(ticker, None)
+        return _MISS
+    return value
+
+
+def _cache_put(ticker: str, value: int | None) -> None:
+    _cache[ticker] = (value, time.monotonic())
+    while len(_cache) > _CACHE_MAX_SIZE:
+        _cache.popitem(last=False)
 
 
 def _real_finnhub_key() -> str | None:
@@ -52,22 +90,32 @@ def _build_universe() -> list[str]:
 async def _fetch_recommendation_shift(client: httpx.AsyncClient, ticker: str, key: str) -> int | None:
     """Return net (strongBuy + buy) change: latest period - prior period.
 
-    Returns None if no data, < 2 snapshots, or fetch error.
+    Cached per ticker, so a Discovery refresh within the TTL spends no Finnhub
+    requests. Returns None if no data, < 2 snapshots, or fetch error.
     """
+    cached = _cache_get(ticker)
+    if not isinstance(cached, _Sentinel):
+        return cached
+
     url = f"{_FINNHUB_BASE}/stock/recommendation"
     try:
         resp = await client.get(url, params={"symbol": ticker, "token": key})
         if resp.status_code != 200:
+            # Not cached: a 429 or 5xx is transient, and caching it would
+            # suppress this ticker for the whole TTL window.
             return None
         data = resp.json()
     except Exception:
         return None
     if not isinstance(data, list) or len(data) < 2:
+        _cache_put(ticker, None)
         return None
     latest, prior = data[0], data[1]
     latest_buys = (latest.get("strongBuy") or 0) + (latest.get("buy") or 0)
     prior_buys = (prior.get("strongBuy") or 0) + (prior.get("buy") or 0)
-    return latest_buys - prior_buys
+    shift = latest_buys - prior_buys
+    _cache_put(ticker, shift)
+    return shift
 
 
 async def fetch() -> list[tuple[str, IdeaSignal]]:

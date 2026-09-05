@@ -1,4 +1,4 @@
-"""Discovery service public API — get_ideas() with 1h cache + snapshot history.
+"""Discovery service public API — get_ideas() with 4h cache + snapshot history.
 
 On fresh compute (cache miss):
   1. Persist a DiscoverySnapshot row per idea (enables historical score tracking).
@@ -9,6 +9,8 @@ On fresh compute (cache miss):
 
 import asyncio
 import logging
+import time
+from dataclasses import dataclass
 from datetime import datetime, timedelta, timezone
 
 from sqlalchemy import func
@@ -17,11 +19,14 @@ from sqlalchemy.orm import Session
 from app.backend.database import SessionLocal
 from app.backend.database.models import DiscoverySnapshot
 from app.backend.models.discovery_schemas import (
+    DiscoveryConcentration,
     DiscoveryHistoryResponse,
     DiscoveryMover,
     DiscoveryMoversResponse,
     DiscoveryResponse,
     DiscoverySnapshotItem,
+    MacroRegimeSnapshot,
+    SectorBreakdown,
 )
 from app.backend.services.discovery_service._engine import aggregate_ideas
 
@@ -29,16 +34,39 @@ logger = logging.getLogger(__name__)
 
 _HIGH_CONFLUENCE_MIN_SOURCES: int = 4
 _HIGH_CONFLUENCE_MIN_SCORE: float = 80.0
+_CACHE_TTL_SECONDS: float = 4 * 3600.0  # 4 hours
+_CONCENTRATION_SAMPLE_SIZE: int = 200  # sector HUD computed over top-N, stable across pages
+
+# Holds the full ranked universe per cold compute. Snapshot dataclass packages
+# ideas + concentration + regime so pagination slices are pure list ops.
+@dataclass(frozen=True)
+class _CachedUniverse:
+    ideas: list  # list[DiscoveryIdea] — full ranked, un-enriched
+    concentration: DiscoveryConcentration
+    macro_regime: MacroRegimeSnapshot
+    generated_at: str
+
+
+# Single-entry cache (replaces the per-limit dict). One universe per TTL window.
+_cache: dict[str, tuple[_CachedUniverse, float]] = {}
+_CACHE_KEY = "discovery:full"
 
 # Single-flight de-dup: when two requests arrive while a compute is in
 # progress, the second one awaits the first task instead of starting a
-# parallel fanout. The dict key is always "discovery:{limit}".
+# parallel fanout.
 _inflight_refreshes: dict[str, asyncio.Task] = {}
 
 
-def _has_high_confluence(response: DiscoveryResponse) -> bool:
+@dataclass(frozen=True)
+class _UniverseLookup:
+    """Universe fetch result + cache-hit flag for paging response metadata."""
+    universe: _CachedUniverse
+    cached: bool
+
+
+def _has_high_confluence(ideas: list) -> bool:
     """True if any idea has >= 4 distinct signal sources AND score >= 80."""
-    for idea in response.ideas:
+    for idea in ideas:
         distinct_sources = len({s.source for s in idea.signals})
         if distinct_sources >= _HIGH_CONFLUENCE_MIN_SOURCES and idea.score >= _HIGH_CONFLUENCE_MIN_SCORE:
             return True
@@ -69,13 +97,14 @@ def _trigger_high_confluence_alert_in_background() -> None:
         logger.debug("No event loop; skipping immediate high_confluence trigger")
 
 
-def _persist_snapshots(response: DiscoveryResponse) -> None:
+def _persist_snapshots(ideas: list) -> None:
     """Persist one DiscoverySnapshot row per idea. Runs synchronously inside
-    the get_ideas flow. Best-effort — DB errors are logged, never raised.
+    the cold-compute flow (NOT per page — would double-write snapshots).
+    Best-effort — DB errors are logged, never raised.
     """
     db: Session = SessionLocal()
     try:
-        for idea in response.ideas:
+        for idea in ideas:
             distinct_sources = len({s.source for s in idea.signals})
             signals_json = [
                 {"source": s.source, "score": s.score, "label": s.label}
@@ -133,56 +162,200 @@ async def _enrich_top_with_alpha(ideas: list, max_enrich: int, days: int) -> Non
             idea.alpha_30d_pct = m.alpha_pct
         idea.distance_from_whale_entry_pct = whale_dist_by_ticker.get(ticker_upper)
 
-        if not idea.company:
-            cm = company_metrics_by_ticker.get(ticker_upper)
-            if cm is not None and cm.long_name:
+        cm = company_metrics_by_ticker.get(ticker_upper)
+        if cm is not None:
+            if not idea.company and cm.long_name:
                 idea.company = cm.long_name
+            if cm.sector:
+                idea.sector = cm.sector
+            if cm.industry:
+                idea.industry = cm.industry
 
 
-async def _compute_fresh(limit: int) -> DiscoveryResponse:
-    all_ideas = await aggregate_ideas()
-    capped = all_ideas[:limit]
-    await _enrich_top_with_alpha(capped, max_enrich=50, days=30)
-    response = DiscoveryResponse(
-        ideas=capped,
-        total=len(all_ideas),
-        cached=False,
+_OVERCROWDING_THRESHOLD_PCT: float = 30.0
+_TOP_TICKERS_PER_SECTOR: int = 5
+
+
+def _compute_concentration(ideas: list) -> DiscoveryConcentration:
+    """Aggregate enriched-tier scores by sector. Unclassified tickers (CIK-
+    only spinoffs, ADRs yfinance hasn't tagged) get bucketed separately so
+    the percentages don't lie when sector data is missing.
+    """
+    by_sector: dict[str, dict] = {}
+    unclassified_total = 0.0
+    grand_total = 0.0
+
+    for idea in ideas:
+        if idea.score <= 0:
+            continue
+        grand_total += idea.score
+        sector = idea.sector
+        if not sector:
+            unclassified_total += idea.score
+            continue
+        bucket = by_sector.setdefault(sector, {"total": 0.0, "tickers": []})
+        bucket["total"] += idea.score
+        bucket["tickers"].append((idea.score, idea.ticker))
+
+    sectors: list[SectorBreakdown] = []
+    overcrowding: list[str] = []
+    if grand_total > 0:
+        for sector, bucket in by_sector.items():
+            pct = bucket["total"] / grand_total * 100.0
+            bucket["tickers"].sort(reverse=True)
+            top = [t for _, t in bucket["tickers"][:_TOP_TICKERS_PER_SECTOR]]
+            sectors.append(SectorBreakdown(
+                sector=sector,
+                score_total=round(bucket["total"], 2),
+                score_pct=round(pct, 1),
+                ticker_count=len(bucket["tickers"]),
+                top_tickers=top,
+            ))
+            if pct >= _OVERCROWDING_THRESHOLD_PCT:
+                overcrowding.append(sector)
+
+    sectors.sort(key=lambda s: -s.score_total)
+    unclassified_pct = (unclassified_total / grand_total * 100.0) if grand_total > 0 else 0.0
+
+    return DiscoveryConcentration(
+        sectors=sectors,
+        overcrowding_threshold_pct=_OVERCROWDING_THRESHOLD_PCT,
+        overcrowding_sectors=overcrowding,
+        unclassified_pct=round(unclassified_pct, 1),
+    )
+
+
+async def _compute_universe() -> _CachedUniverse:
+    """Run all 22 sources, persist snapshots, fire high-confluence alerts.
+    Returns the full ranked universe (un-enriched). The only path that ever
+    calls aggregate_ideas() — every page request slices this result.
+    """
+    aggregated = await aggregate_ideas()
+    all_ideas = aggregated.ideas
+    regime = aggregated.regime
+
+    # Concentration computed once over a stable sample, NOT per-page —
+    # otherwise sector mix would mutate as the user pages deeper.
+    concentration = _compute_concentration(all_ideas[:_CONCENTRATION_SAMPLE_SIZE])
+
+    _persist_snapshots(all_ideas)
+    if _has_high_confluence(all_ideas):
+        _trigger_high_confluence_alert_in_background()
+
+    return _CachedUniverse(
+        ideas=all_ideas,
+        concentration=concentration,
+        macro_regime=MacroRegimeSnapshot(
+            mode=regime.mode,
+            score_multiplier=regime.score_multiplier,
+            reasons=regime.reasons,
+            metrics=regime.metrics,
+            as_of=regime.as_of,
+        ),
         generated_at=datetime.now(timezone.utc).isoformat(),
     )
 
-    _persist_snapshots(response)
-    if _has_high_confluence(response):
-        _trigger_high_confluence_alert_in_background()
 
-    return response
+async def _get_or_compute_universe() -> _UniverseLookup:
+    """Single-entry cache wrapper. Returns the cached universe + whether
+    the response was served from cache. Single-flight de-dup so concurrent
+    page requests share one cold compute.
+    """
+    entry = _cache.get(_CACHE_KEY)
+    if entry is not None:
+        universe, ts = entry
+        if time.monotonic() - ts <= _CACHE_TTL_SECONDS:
+            return _UniverseLookup(universe=universe, cached=True)
+        _cache.pop(_CACHE_KEY, None)
+
+    inflight = _inflight_refreshes.get(_CACHE_KEY)
+    if inflight is not None and not inflight.done():
+        result = await asyncio.shield(inflight)
+        return _UniverseLookup(universe=result, cached=False)
+
+    async def _run() -> _CachedUniverse:
+        try:
+            universe = await _compute_universe()
+            _cache[_CACHE_KEY] = (universe, time.monotonic())
+            return universe
+        finally:
+            _inflight_refreshes.pop(_CACHE_KEY, None)
+
+    task = asyncio.create_task(_run())
+    _inflight_refreshes[_CACHE_KEY] = task
+    universe = await task
+    return _UniverseLookup(universe=universe, cached=False)
 
 
-def _key(limit: int) -> str:
-    return f"discovery:{limit}"
+def get_cache_ttl_seconds() -> float:
+    """How long a computed universe stays served before recompute."""
+    return _CACHE_TTL_SECONDS
+
+
+def flush_cache() -> dict[str, int]:
+    """Drop the cached universe so the next request recomputes from scratch.
+
+    Cancels any in-flight refresh too: without that, a request arriving during
+    a compute that started before the flush would await it and receive the very
+    ranking the caller asked to discard.
+
+    Returns:
+        {label: entries_cleared} for the caches this owns, so a UI can report
+        whether anything was actually cached.
+    """
+    entries = len(_cache)
+    _cache.clear()
+
+    cancelled = 0
+    for task in list(_inflight_refreshes.values()):
+        if isinstance(task, asyncio.Task) and not task.done():
+            task.cancel()
+            cancelled += 1
+    _inflight_refreshes.clear()
+
+    logger.info("discovery: cache flushed (%d universe, %d in-flight cancelled)", entries, cancelled)
+    return {"discovery_ideas": entries, "discovery_inflight": cancelled}
+
+
+async def get_ideas_page(page: int = 1, page_size: int = 100) -> DiscoveryResponse:
+    """Return ONE page from the cached ranked universe.
+
+    Cold compute runs once per TTL window (~30-40s). Subsequent pages slice the
+    cached list and enrich just their slice (~3-5s, sub-50ms once the
+    fundamentals 24h cache is warm).
+    """
+    page = max(1, page)
+    page_size = max(1, min(page_size, 200))
+
+    lookup = await _get_or_compute_universe()
+    universe = lookup.universe
+    total = len(universe.ideas)
+    total_pages = max(1, (total + page_size - 1) // page_size)
+    start = (page - 1) * page_size
+    end = start + page_size
+    slice_ideas = universe.ideas[start:end]
+
+    await _enrich_top_with_alpha(slice_ideas, max_enrich=page_size, days=30)
+
+    return DiscoveryResponse(
+        ideas=slice_ideas,
+        total=total,
+        cached=lookup.cached,
+        generated_at=universe.generated_at,
+        concentration=universe.concentration,
+        macro_regime=universe.macro_regime,
+        page=page,
+        page_size=page_size,
+        total_pages=total_pages,
+        has_more=end < total,
+    )
 
 
 async def get_ideas(limit: int = 50) -> DiscoveryResponse:
-    """Compute Discovery ideas fresh on every call.
-
-    No in-memory cache, no DB-snapshot hydration — every request runs the
-    full source fanout. Concurrent requests with the same limit share one
-    compute via the inflight-task dedup.
+    """Back-compat wrapper: returns page 1 with ``limit`` items. New code
+    should prefer get_ideas_page(page, page_size) for explicit pagination.
     """
-    key = _key(limit)
-
-    inflight = _inflight_refreshes.get(key)
-    if inflight is not None and not inflight.done():
-        return await asyncio.shield(inflight)
-
-    async def _run() -> DiscoveryResponse:
-        try:
-            return await _compute_fresh(limit)
-        finally:
-            _inflight_refreshes.pop(key, None)
-
-    task = asyncio.create_task(_run())
-    _inflight_refreshes[key] = task
-    return await task
+    return await get_ideas_page(page=1, page_size=limit)
 
 
 def _to_snapshot_item(row: DiscoverySnapshot) -> DiscoverySnapshotItem:

@@ -1,11 +1,13 @@
-"""Discovery source: tickers with cluster insider buys (3+ distinct insiders).
+"""Discovery source: tickers with cluster insider buys (multiple distinct insiders).
 
-Reuses the OpenInsider `cluster_buy` preset (already cached). Aggregates
-records by ticker, counts distinct insiders + total dollar value.
+Aggregates the broader `latest_insider_buys_25k` feed, not OpenInsider's
+`cluster_buy` preset — that preset returns one summary row per ticker so
+distinct-insider counting always yields 1. The 25k feed returns the raw
+per-insider rows where real clusters become visible after grouping.
 
 Score:
-  - 15 base when 3-4 distinct insiders bought
-  - 25 when 5+ distinct insiders bought ("everyone's buying" moment)
+  - 15 base when 2-3 distinct insiders bought
+  - 25 when 4+ distinct insiders bought ("everyone's buying" moment)
 """
 
 import logging
@@ -15,14 +17,14 @@ from app.backend.models.discovery_schemas import IdeaSignal
 
 logger = logging.getLogger(__name__)
 
-_MIN_INSIDERS = 3
-_BIG_CLUSTER = 5
+_MIN_INSIDERS = 2
+_BIG_CLUSTER = 4
 
 
 async def fetch() -> list[tuple[str, IdeaSignal]]:
     try:
         from app.backend.services.openinsider_service import get_openinsider_screener
-        response = await get_openinsider_screener("cluster_buy", None)
+        response = await get_openinsider_screener("latest_insider_buys_25k", None)
     except Exception as exc:
         logger.warning("cluster_buy source: fetch failed: %s", exc)
         return []

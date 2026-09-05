@@ -261,6 +261,31 @@ class WatchlistItem(Base):
     last_error = Column(Text, nullable=True)
 
 
+class Position(Base):
+    """A holding the user owns: shares + average cost basis per share.
+
+    Unlike WatchlistItem (ticker only), the cost basis and size here enable
+    P&L tracking and the stop_loss exit alert, which reacts to price rather
+    than to filings. shares is Float to permit fractional-share brokerages.
+    """
+    __tablename__ = "positions"
+
+    id = Column(Integer, primary_key=True, index=True)
+    ticker = Column(String(20), nullable=False, unique=True, index=True)
+    shares = Column(Float, nullable=False)
+    cost_basis = Column(Float, nullable=False)  # average cost per share
+    entry_date = Column(DateTime(timezone=True), server_default=func.now(), nullable=False)
+    notes = Column(Text, nullable=True)
+    # Exit level fixed at entry, so the decision is made before the position
+    # moves. Nullable: ATR is unavailable for a name yfinance cannot price, and
+    # a guessed stop is worse than none.
+    stop_loss_price = Column(Float, nullable=True)
+    stop_atr = Column(Float, nullable=True)
+    stop_multiple = Column(Float, nullable=True)
+    created_at = Column(DateTime(timezone=True), server_default=func.now())
+    updated_at = Column(DateTime(timezone=True), onupdate=func.now())
+
+
 class DiscoverySnapshot(Base):
     """Per-ticker Discovery score snapshots, written on each fresh compute.
 
@@ -327,4 +352,24 @@ class WhaleEntryCache(Base):
     __table_args__ = (
         Index("ix_whale_entry_cache_whale_ticker", "whale_cik", "ticker", unique=True),
         Index("ix_whale_entry_cache_ticker", "ticker"),
+    )
+
+
+class HeadcountSnapshot(Base):
+    """Periodic snapshot of yfinance fullTimeEmployees per ticker.
+
+    yfinance only exposes the CURRENT value (sourced from the most recent
+    10-K). To compute YoY growth we have to persist our own history. The
+    hiring_velocity Discovery source reads (latest, ~365d-ago) pairs from
+    this table to detect structural headcount expansion.
+    """
+    __tablename__ = "headcount_snapshots"
+
+    id = Column(Integer, primary_key=True, index=True)
+    ticker = Column(String(20), nullable=False, index=True)
+    employee_count = Column(Integer, nullable=False)
+    snapshot_at = Column(DateTime(timezone=True), server_default=func.now(), nullable=False, index=True)
+
+    __table_args__ = (
+        Index("ix_headcount_snapshots_ticker_at", "ticker", "snapshot_at"),
     )

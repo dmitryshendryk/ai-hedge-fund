@@ -1,5 +1,5 @@
 import { cn } from '@/lib/utils';
-import { BarChart3, BookOpen, Calendar, Compass, Home, History, Newspaper, Settings, Star, UserCheck, Workflow, Zap } from 'lucide-react';
+import { BarChart3, BookOpen, Briefcase, Calendar, Compass, Home, History, Newspaper, Settings, Star, UserCheck, Workflow, Zap } from 'lucide-react';
 import { NavLink } from 'react-router-dom';
 
 import { NotificationBell } from './notification-bell';
@@ -11,6 +11,7 @@ const navItems = [
   { to: '/news', label: 'News', icon: BookOpen },
   { to: '/discovery', label: 'Discovery', icon: Compass },
   { to: '/watchlist', label: 'Watchlist', icon: Star },
+  { to: '/positions', label: 'Positions', icon: Briefcase },
   { to: '/calendar', label: 'Calendar', icon: Calendar },
   { to: '/catalysts', label: 'Catalysts', icon: Zap },
   { to: '/screener', label: 'Screener', icon: BarChart3 },

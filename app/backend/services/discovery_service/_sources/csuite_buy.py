@@ -21,7 +21,7 @@ _CSUITE_TITLE_TOKENS = (
     "ceo", "cfo", "coo", "president",
     "chief executive", "chief financial", "chief operating",
 )
-_MIN_VALUE = 250_000.0
+_MIN_VALUE = 50_000.0
 _BIG_VALUE = 1_000_000.0
 
 

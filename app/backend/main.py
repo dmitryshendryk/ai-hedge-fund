@@ -3,6 +3,8 @@ from fastapi.middleware.cors import CORSMiddleware
 import logging
 import asyncio
 
+from app.backend.safe_json_response import SafeJSONResponse
+
 from app.backend.routes import api_router
 from app.backend.database.connection import engine
 from app.backend.database.models import Base
@@ -20,7 +22,12 @@ logger = logging.getLogger(__name__)
 #   - edgar.core: per-filing parser warnings on legacy SEC documents
 logging.getLogger("yfinance").setLevel(logging.CRITICAL)
 
-app = FastAPI(title="AI Hedge Fund API", description="Backend API for AI Hedge Fund", version="0.1.0")
+app = FastAPI(
+    title="AI Hedge Fund API",
+    description="Backend API for AI Hedge Fund",
+    version="0.1.0",
+    default_response_class=SafeJSONResponse,
+)
 
 # Scheduler instance (lifecycle managed via startup/shutdown events)
 _scraping_scheduler = ScrapingScheduler()

@@ -20,16 +20,64 @@ class DiscoveryIdea(BaseModel):
     score: float
     signals: list[IdeaSignal]
     is_ticker: bool = True  # False if `ticker` field actually holds a CIK
+    sector: str | None = None  # yfinance Ticker.info["sector"], populated by the alpha enricher
+    industry: str | None = None  # finer than sector: semis vs semicap de-rate independently
     return_30d_pct: float | None = None
     alpha_30d_pct: float | None = None
     distance_from_whale_entry_pct: float | None = None
+    pct_above_sma: float | None = None  # percent, not a fraction; None when unpriceable
+    exhaustion_penalty: float = 0.0  # points already subtracted from score
+
+
+class SectorBreakdown(BaseModel):
+    """Aggregated cumulative score for one sector across the top ideas."""
+    sector: str
+    score_total: float
+    score_pct: float  # share of the cumulative top-N score
+    ticker_count: int
+    top_tickers: list[str]
+
+
+class DiscoveryConcentration(BaseModel):
+    """Top-of-Discovery sector mix + an overcrowding warning list."""
+    sectors: list[SectorBreakdown]
+    overcrowding_threshold_pct: float
+    overcrowding_sectors: list[str]
+    unclassified_pct: float  # share of score with no known sector
+
+
+class MacroRegimeSnapshot(BaseModel):
+    """Current macro 'weather' applied to Discovery scoring."""
+    mode: str  # "risk_on" | "risk_off"
+    score_multiplier: float  # 1.0 on risk_on, 0.3 on risk_off
+    reasons: list[str]  # empty in risk_on
+    metrics: dict[str, float | None]  # yield_curve_10y_2y, vix, hy_oas
+    as_of: str | None = None  # ISO date of most recent FRED observation
 
 
 class DiscoveryResponse(BaseModel):
     ideas: list[DiscoveryIdea]
-    total: int
+    total: int  # total ideas in the cached universe BEFORE pagination
     cached: bool
     generated_at: str  # ISO timestamp
+    concentration: DiscoveryConcentration | None = None
+    macro_regime: MacroRegimeSnapshot | None = None
+    page: int = 1
+    page_size: int = 50
+    total_pages: int = 1
+    has_more: bool = False
+
+
+class DiscoveryCacheFlushResponse(BaseModel):
+    """What a Discovery cache flush actually discarded.
+
+    Mirrors the platform-wide POST /cache/flush shape so one client handler
+    covers both. Counts are zero when nothing was cached, which the UI reports
+    rather than claiming a refresh happened.
+    """
+    cleared: dict[str, int]
+    total_entries: int
+    cache_ttl_seconds: float  # how long the next compute stays cached
 
 
 class DiscoverySnapshotItem(BaseModel):

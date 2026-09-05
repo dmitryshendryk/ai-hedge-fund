@@ -12,6 +12,7 @@ import { ScrapingResultsPage } from './pages/scraping-results-page';
 import { ScreenerPage } from './pages/screener-page';
 import { SettingsPage } from './pages/settings-page';
 import { WatchlistPage } from './pages/watchlist-page';
+import { PositionsPage } from './pages/positions-page';
 import { CalendarPage } from './pages/calendar-page';
 import { DiscoveryPage } from './pages/discovery-page';
 import { TickerDetailPage } from './pages/ticker-detail-page';
@@ -35,6 +36,7 @@ export default function App() {
               <Route path="/scraping" element={<ScrapingResultsPage />} />
               <Route path="/news" element={<NewsPage />} />
               <Route path="/watchlist" element={<WatchlistPage />} />
+              <Route path="/positions" element={<PositionsPage />} />
               <Route path="/calendar" element={<CalendarPage />} />
               <Route path="/discovery" element={<DiscoveryPage />} />
               <Route path="/ticker/:ticker" element={<TickerDetailPage />} />

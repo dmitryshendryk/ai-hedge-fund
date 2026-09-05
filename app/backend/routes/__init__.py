@@ -25,6 +25,9 @@ from app.backend.routes.discovery import router as discovery_router
 from app.backend.routes.whales import router as whales_router
 from app.backend.routes.backtest import router as backtest_router
 from app.backend.routes.cache import router as cache_router
+from app.backend.routes.devils_advocate import router as devils_advocate_router
+from app.backend.routes.positions import router as positions_router
+from app.backend.routes.ticker import router as ticker_router
 
 # Main API router
 api_router = APIRouter()
@@ -55,3 +58,6 @@ api_router.include_router(discovery_router, tags=["discovery"])
 api_router.include_router(whales_router, tags=["whales"])
 api_router.include_router(backtest_router, tags=["backtest"])
 api_router.include_router(cache_router, tags=["cache"])
+api_router.include_router(devils_advocate_router, tags=["devils-advocate"])
+api_router.include_router(positions_router, tags=["positions"])
+api_router.include_router(ticker_router, tags=["ticker"])
