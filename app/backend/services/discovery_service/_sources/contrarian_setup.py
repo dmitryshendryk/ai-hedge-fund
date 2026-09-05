@@ -24,7 +24,7 @@ _BASE_SCORE = 25.0
 _DEEP_BEARISH_THRESHOLD = 0.6
 _DEEP_SCORE = 35.0
 _MIN_BEARISH_LEAD = 0.05  # bearish must lead bullish by at least 5pp
-_MIN_TICKER_INSIDERS = 2  # filter tiny-noise tickers
+_MIN_TICKER_INSIDERS = 1  # any insider conviction buy + bearish news = contrarian
 
 
 async def fetch() -> list[tuple[str, IdeaSignal]]:
@@ -37,14 +37,16 @@ async def fetch() -> list[tuple[str, IdeaSignal]]:
 
     insider_records: dict[str, list] = defaultdict(list)
 
-    cluster_task = get_openinsider_screener("cluster_buy", None)
+    # latest_insider_buys_25k has real per-insider rows — the cluster_buy preset
+    # returns one summary row per ticker so distinct-insider counting yields 1.
+    buys_task = get_openinsider_screener("latest_insider_buys_25k", None)
     csuite_task = get_openinsider_screener("ceo_cfo_conviction", None)
-    cluster_resp, csuite_resp = await asyncio.gather(
-        cluster_task, csuite_task, return_exceptions=True,
+    buys_resp, csuite_resp = await asyncio.gather(
+        buys_task, csuite_task, return_exceptions=True,
     )
 
-    if not isinstance(cluster_resp, BaseException):
-        for rec in cluster_resp.records:
+    if not isinstance(buys_resp, BaseException):
+        for rec in buys_resp.records:
             if rec.ticker:
                 insider_records[rec.ticker.upper()].append(rec)
     if not isinstance(csuite_resp, BaseException):

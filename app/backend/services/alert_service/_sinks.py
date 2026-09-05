@@ -38,6 +38,13 @@ async def send_telegram(bot_token: str, chat_id: str, text: str) -> tuple[bool, 
         return False, f"Unexpected error: {exc}"
 
 
+_EXIT_RULES: frozenset[str] = frozenset({
+    "insider_dumping",
+    "technical_breakdown",
+    "whale_exit",
+})
+
+
 def format_telegram_message(candidate: AlertCandidate) -> str:
     """Plain-text message body for Telegram (no markdown to avoid parsing issues)."""
     # high_confluence rule already includes 🚨 in its title; other rules get a
@@ -48,6 +55,13 @@ def format_telegram_message(candidate: AlertCandidate) -> str:
             f"{candidate.title}\n\n"
             f"{candidate.message}\n\n"
             "— SUPER-NOVA confluence detected —"
+        )
+    if candidate.rule_type in _EXIT_RULES:
+        return (
+            "🚪 EXIT WATCH 🚪\n"
+            f"{candidate.title}\n\n"
+            f"{candidate.message}\n\n"
+            "— review your position —"
         )
     sev_emoji = {"info": "🔵", "warning": "🟡", "critical": "🔴"}.get(candidate.severity, "🔵")
     return f"{sev_emoji} {candidate.title}\n\n{candidate.message}"

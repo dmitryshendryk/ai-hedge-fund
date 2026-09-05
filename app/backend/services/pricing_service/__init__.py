@@ -25,8 +25,10 @@ import logging
 import math
 import time
 from collections import OrderedDict
+from collections.abc import Callable
 from dataclasses import dataclass
 from datetime import date, datetime, timedelta, timezone
+from enum import Enum
 
 import pandas as pd
 import yfinance as yf
@@ -46,7 +48,7 @@ class _RateLimited(Exception):
 
 
 _yfinance_semaphore: asyncio.Semaphore = asyncio.Semaphore(_MAX_CONCURRENT_YFINANCE_CALLS)
-_inflight_locks: dict[tuple[str, str], asyncio.Lock] = {}
+_inflight_locks: dict[tuple[str, ...], asyncio.Lock] = {}
 
 # Circuit breaker: when yfinance starts throttling, every subsequent call
 # returns None immediately for _GLOBAL_COOLDOWN_SECONDS rather than queuing
@@ -136,6 +138,74 @@ def _cache_put(key: tuple[str, str], value: PeriodReturn | None) -> None:
     _period_cache[key] = (value, time.monotonic())
     while len(_period_cache) > _CACHE_MAX_SIZE:
         _period_cache.popitem(last=False)
+
+
+# Snapshot caches (SMA cross, technical read, ATR, VCP) share one TTL store.
+# Each is a full history fetch per ticker, and one Discovery refresh asks for the
+# same tickers repeatedly — the exhaustion penalty alone reads up to 100 SMA
+# crosses, several of which the Devil's Advocate overlay then asks for again.
+_SNAPSHOT_CACHE_TTL_SECONDS = 1800.0
+_SNAPSHOT_CACHE_MAX_SIZE = 500
+
+
+class _Miss(Enum):
+    """Distinct from None, which is a legal cached value for a ticker yfinance
+    cannot price. Caching that None is what stops a delisted symbol being
+    refetched once per idea in the batch.
+    """
+    TOKEN = "miss"
+
+
+_MISS = _Miss.TOKEN
+
+_snapshot_cache: OrderedDict[tuple[str, ...], tuple[object, float]] = OrderedDict()
+
+
+def _snapshot_cache_get(key: tuple[str, ...]) -> object:
+    entry = _snapshot_cache.get(key)
+    if entry is None:
+        return _MISS
+    value, ts = entry
+    if time.monotonic() - ts > _SNAPSHOT_CACHE_TTL_SECONDS:
+        _snapshot_cache.pop(key, None)
+        return _MISS
+    return value
+
+
+def _snapshot_cache_put(key: tuple[str, ...], value: object) -> None:
+    _snapshot_cache[key] = (value, time.monotonic())
+    while len(_snapshot_cache) > _SNAPSHOT_CACHE_MAX_SIZE:
+        _snapshot_cache.popitem(last=False)
+
+
+async def _cached_snapshot(key: tuple[str, ...], compute: Callable[[], object]) -> object:
+    """Serve one yfinance-backed snapshot, fetching it at most once per TTL.
+
+    The per-key lock makes concurrent callers share one fetch instead of racing
+    past the same miss. A cooldown or rate-limit outcome is never cached, so
+    throttling degrades the current call rather than pinning None for the window.
+    """
+    cached = _snapshot_cache_get(key)
+    if cached is not _MISS:
+        return cached
+    if _is_in_cooldown():
+        return None
+
+    lock = _inflight_locks.setdefault(key, asyncio.Lock())
+    async with lock:
+        cached = _snapshot_cache_get(key)
+        if cached is not _MISS:
+            return cached
+        if _is_in_cooldown():
+            return None
+        async with _yfinance_semaphore:
+            try:
+                value = await asyncio.to_thread(compute)
+            except _RateLimited:
+                _trigger_cooldown()
+                return None
+    _snapshot_cache_put(key, value)
+    return value
 
 
 def _coerce_since(since: date | datetime | str) -> date:
@@ -351,16 +421,12 @@ def _compute_sma_sync(ticker: str, days: int) -> SmaCross | None:
 
 async def get_sma_cross(ticker: str, days: int = 200) -> SmaCross | None:
     """Cached: latest close vs N-day SMA. Used by the technical_breakdown
-    exit-alert rule. Shares the global yfinance cooldown / semaphore guard.
+    exit-alert rule and the Discovery exhaustion penalty. Shares the global
+    yfinance cooldown / semaphore guard.
     """
-    if _is_in_cooldown():
-        return None
-    async with _yfinance_semaphore:
-        try:
-            return await asyncio.to_thread(_compute_sma_sync, ticker.upper(), days)
-        except _RateLimited:
-            _trigger_cooldown()
-            return None
+    sym = ticker.upper()
+    result = await _cached_snapshot(("sma", sym, str(days)), lambda: _compute_sma_sync(sym, days))
+    return result if isinstance(result, SmaCross) else None
 
 
 @dataclass
@@ -412,18 +478,16 @@ def _compute_technical_snapshot_sync(ticker: str, days: int) -> TechnicalSnapsho
 
 
 async def get_technical_snapshot(ticker: str, sma_days: int = 200) -> TechnicalSnapshot | None:
-    """Single-fetch snapshot: latest close, N-day SMA + extension, and RSI(14).
-    Used by the technical_exhaustion Devil's Advocate detector. Shares the
-    global yfinance cooldown / semaphore guard.
+    """Cached single-fetch snapshot: latest close, N-day SMA + extension, and
+    RSI(14). Used by the technical_exhaustion Devil's Advocate detector. Shares
+    the global yfinance cooldown / semaphore guard.
     """
-    if _is_in_cooldown():
-        return None
-    async with _yfinance_semaphore:
-        try:
-            return await asyncio.to_thread(_compute_technical_snapshot_sync, ticker.upper(), sma_days)
-        except _RateLimited:
-            _trigger_cooldown()
-            return None
+    sym = ticker.upper()
+    result = await _cached_snapshot(
+        ("technical", sym, str(sma_days)),
+        lambda: _compute_technical_snapshot_sync(sym, sma_days),
+    )
+    return result if isinstance(result, TechnicalSnapshot) else None
 
 
 # Stop distance as a multiple of ATR. 1.5x sits outside normal daily noise, so a
@@ -504,15 +568,163 @@ def _compute_atr_sync(ticker: str, period: int) -> AtrSnapshot | None:
 
 
 async def get_atr(ticker: str, period: int = _ATR_PERIOD) -> AtrSnapshot | None:
-    """ATR read sharing the global yfinance cooldown / semaphore guard."""
-    if _is_in_cooldown():
+    """Cached ATR read sharing the global yfinance cooldown / semaphore guard."""
+    sym = ticker.upper()
+    result = await _cached_snapshot(("atr", sym, str(period)), lambda: _compute_atr_sync(sym, period))
+    return result if isinstance(result, AtrSnapshot) else None
+
+
+# VCP (volatility contraction pattern): a base that tightens while the trend
+# holds and volume dries up, read as supply exhausting before a breakout.
+_VCP_WEEKS: int = 3
+_VCP_WEEK_BARS: int = 5
+_VCP_FAST_SMA_DAYS: int = 50
+_VCP_SLOW_SMA_DAYS: int = 200
+_VCP_VOLUME_DRYUP_RATIO: float = 0.7
+
+
+def _weekly_range_pcts(
+    frame: "pd.DataFrame",
+    weeks: int = _VCP_WEEKS,
+    bars_per_week: int = _VCP_WEEK_BARS,
+) -> list[float] | None:
+    """High-low span of each trailing week, as a percent of that week's close.
+
+    A week is `bars_per_week` consecutive trading bars ending at the latest one,
+    so holidays need no calendar alignment.
+
+    Returns:
+        Oldest week first, so a tightening base reads as a falling list. None
+        when High/Low/Close are absent or too few bars remain.
+    """
+    required = ("High", "Low", "Close")
+    if frame is None or any(col not in frame.columns for col in required):
         return None
-    async with _yfinance_semaphore:
+    clean = frame.dropna(subset=list(required))
+    needed = weeks * bars_per_week
+    if len(clean) < needed:
+        return None
+
+    window = clean.tail(needed)
+    ranges: list[float] = []
+    for index in range(weeks):
+        week = window.iloc[index * bars_per_week:(index + 1) * bars_per_week]
         try:
-            return await asyncio.to_thread(_compute_atr_sync, ticker.upper(), period)
-        except _RateLimited:
-            _trigger_cooldown()
+            close = float(week["Close"].iloc[-1])
+            span = float(week["High"].max() - week["Low"].min())
+        except (ValueError, TypeError, IndexError):
             return None
+        if close <= 0 or not math.isfinite(span):
+            return None
+        ranges.append(round(span / close * 100.0, 4))
+    return ranges
+
+
+@dataclass
+class VcpSnapshot:
+    """The three VCP legs for one ticker, each reported separately.
+
+    Keeping the legs apart lets a caller explain a near-miss rather than only a
+    pass, and lets the contraction rule change without touching the fetch.
+    """
+    ticker: str
+    latest_close: float
+    sma50: float
+    sma200: float
+    weekly_range_pcts: list[float]  # oldest week first
+    latest_volume: float
+    avg_volume50: float
+    volume_ratio: float  # latest volume over the 50-day average
+
+    @property
+    def trend_ok(self) -> bool:
+        return self.latest_close > self.sma50 > self.sma200
+
+    @property
+    def contraction_ok(self) -> bool:
+        """True when every week's range is below the one before it."""
+        ranges = self.weekly_range_pcts
+        if len(ranges) < 2:
+            return False
+        return all(ranges[i] > ranges[i + 1] for i in range(len(ranges) - 1))
+
+    @property
+    def volume_dry_up(self) -> bool:
+        return self.volume_ratio < _VCP_VOLUME_DRYUP_RATIO
+
+    @property
+    def is_setup(self) -> bool:
+        return self.trend_ok and self.contraction_ok and self.volume_dry_up
+
+
+def _build_vcp_snapshot(ticker: str, history: "pd.DataFrame") -> VcpSnapshot | None:
+    """VCP legs from one OHLCV frame.
+
+    Returns:
+        None when a column is absent or fewer than the slow-SMA window of bars
+        remain; a shorter history cannot establish the trend leg.
+    """
+    required = ("High", "Low", "Close", "Volume")
+    if history is None or any(col not in history.columns for col in required):
+        return None
+    clean = history.dropna(subset=list(required))
+    if len(clean) < _VCP_SLOW_SMA_DAYS:
+        return None
+
+    closes = clean["Close"]
+    volumes = clean["Volume"]
+    try:
+        latest_close = float(closes.iloc[-1])
+        sma50 = float(closes.tail(_VCP_FAST_SMA_DAYS).mean())
+        sma200 = float(closes.tail(_VCP_SLOW_SMA_DAYS).mean())
+        latest_volume = float(volumes.iloc[-1])
+        avg_volume = float(volumes.tail(_VCP_FAST_SMA_DAYS).mean())
+    except (ValueError, TypeError, IndexError):
+        return None
+    if not all(math.isfinite(v) for v in (latest_close, sma50, sma200, latest_volume, avg_volume)):
+        return None
+    if latest_close <= 0 or sma50 <= 0 or sma200 <= 0 or avg_volume <= 0:
+        return None
+
+    ranges = _weekly_range_pcts(clean)
+    if ranges is None:
+        return None
+
+    return VcpSnapshot(
+        ticker=ticker.upper(),
+        latest_close=latest_close,
+        sma50=round(sma50, 4),
+        sma200=round(sma200, 4),
+        weekly_range_pcts=ranges,
+        latest_volume=latest_volume,
+        avg_volume50=round(avg_volume, 2),
+        volume_ratio=round(latest_volume / avg_volume, 4),
+    )
+
+
+def _fetch_vcp_sync(ticker: str) -> VcpSnapshot | None:
+    end = date.today() + timedelta(days=1)
+    start = end - timedelta(days=int(_VCP_SLOW_SMA_DAYS * 1.6) + 30)
+    try:
+        history = yf.Ticker(ticker).history(start=start, end=end, auto_adjust=True)
+    except Exception as exc:
+        msg = str(exc)
+        if _is_rate_limit_message(msg):
+            raise _RateLimited(msg) from exc
+        logger.warning("pricing_service VCP failed for %s: %s", ticker, exc)
+        return None
+    if history is None or history.empty:
+        return None
+    return _build_vcp_snapshot(ticker, history)
+
+
+async def get_vcp_snapshot(ticker: str) -> VcpSnapshot | None:
+    """Cached: one OHLCV fetch covering trend, base contraction and volume
+    dry-up. Shares the global yfinance cooldown / semaphore guard.
+    """
+    sym = ticker.upper()
+    result = await _cached_snapshot(("vcp", sym), lambda: _fetch_vcp_sync(sym))
+    return result if isinstance(result, VcpSnapshot) else None
 
 
 @dataclass

@@ -5,11 +5,18 @@ import logging
 from fastapi import APIRouter, HTTPException, Query
 
 from app.backend.models.discovery_schemas import (
+    DiscoveryCacheFlushResponse,
     DiscoveryHistoryResponse,
     DiscoveryMoversResponse,
     DiscoveryResponse,
 )
-from app.backend.services.discovery_service import get_history, get_ideas, get_movers
+from app.backend.services.discovery_service import (
+    flush_cache,
+    get_cache_ttl_seconds,
+    get_history,
+    get_ideas_page,
+    get_movers,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -18,7 +25,14 @@ router = APIRouter(prefix="/discovery", tags=["discovery"])
 
 @router.get("/ideas", response_model=DiscoveryResponse)
 async def ideas_endpoint(
-    limit: int = Query(50, ge=1, le=200),
+    page: int = Query(1, ge=1, description="1-based page index"),
+    page_size: int = Query(100, ge=1, le=200, description="Items per page (max 200)"),
+    limit: int | None = Query(
+        None,
+        ge=1,
+        le=200,
+        description="DEPRECATED: synonym for page_size when page is omitted. Use page+page_size for new code.",
+    ),
     max_above_whale_pct: float | None = Query(
         None,
         description="If set, filter out ideas trading more than this % above the best whale entry. 0 = off.",
@@ -32,8 +46,11 @@ async def ideas_endpoint(
         description="If set, filter out ideas with debt/equity above this (zombie-company guard). 0 = off.",
     ),
 ) -> DiscoveryResponse:
+    # Back-compat: old clients pass only `limit`. Treat as page 1.
+    effective_page_size = limit if limit is not None else page_size
+
     try:
-        response = await get_ideas(limit)
+        response = await get_ideas_page(page=page, page_size=effective_page_size)
     except Exception as exc:
         logger.exception("Discovery aggregation failed")
         raise HTTPException(status_code=503, detail=str(exc)) from exc
@@ -72,11 +89,35 @@ async def ideas_endpoint(
         return True
 
     filtered = [idea for idea in response.ideas if _passes(idea)]
+    # Path A: filtered count may be < page_size, but total/total_pages/has_more
+    # reflect the UNFILTERED universe so "Load more" keeps working against the
+    # cached ranking. Frontend shows actual filtered count separately.
     return DiscoveryResponse(
         ideas=filtered,
-        total=len(filtered),
+        total=response.total,
         cached=response.cached,
         generated_at=response.generated_at,
+        concentration=response.concentration,
+        macro_regime=response.macro_regime,
+        page=response.page,
+        page_size=response.page_size,
+        total_pages=response.total_pages,
+        has_more=response.has_more,
+    )
+
+
+@router.post("/cache/flush", response_model=DiscoveryCacheFlushResponse)
+def flush_cache_endpoint() -> DiscoveryCacheFlushResponse:
+    """Discard the cached ranked universe so the next /ideas call recomputes.
+
+    Narrower than POST /cache/flush: the shared fundamentals, pricing and news
+    caches survive, so the recompute costs a fanout rather than a cold start.
+    """
+    cleared = flush_cache()
+    return DiscoveryCacheFlushResponse(
+        cleared=cleared,
+        total_entries=sum(cleared.values()),
+        cache_ttl_seconds=get_cache_ttl_seconds(),
     )
 
 

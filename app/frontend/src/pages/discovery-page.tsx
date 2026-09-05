@@ -1,5 +1,5 @@
 import { useEffect, useMemo, useState } from 'react';
-import { Compass, ExternalLink, Loader2, RefreshCw, Star } from 'lucide-react';
+import { Compass, ExternalLink, Loader2, RefreshCw, Star, Trash2 } from 'lucide-react';
 import { Link } from 'react-router-dom';
 import { toast } from 'sonner';
 
@@ -36,10 +36,11 @@ const STRATEGY_SOURCES: Record<Exclude<StrategyKey, 'all'>, Set<string>> = {
     'insider_doubling_down', 'first_time_buyer', 'repeat_buyer',
     'csuite_buy', 'revenue_acceleration', 'commodity_tailwind',
     'relative_strength', 'activist_13d', 'contrarian_setup',
+    'vcp_breakout_setup',
   ]),
   compounders: new Set([
     'quality_score', 'high_roic', 'dividend_grower', 'analyst', 'csuite_buy',
-    'share_cannibal',
+    'share_cannibal', 'true_shareholder_yield', 'piotroski_score',
   ]),
   deep_value: new Set([
     'valuation_score', 'fcf_yield', 'contrarian_setup',
@@ -200,6 +201,7 @@ export function DiscoveryPage() {
   const [generatedAt, setGeneratedAt] = useState<string | null>(null);
   const [cached, setCached] = useState(false);
   const [bulkLoading, setBulkLoading] = useState(false);
+  const [flushing, setFlushing] = useState(false);
   const [dontChase, setDontChase] = useState(false);
   const [strategy, setStrategy] = useState<StrategyKey>('all');
   const [page, setPage] = useState(1);
@@ -240,6 +242,26 @@ export function DiscoveryPage() {
       setError(e instanceof Error ? e.message : 'Failed to load ideas');
     } finally {
       setLoading(false);
+    }
+  };
+
+  // Refresh alone re-serves the cached ranking for the rest of the TTL, so
+  // forcing a recompute means discarding the server cache first.
+  const handleFlushCache = async () => {
+    setFlushing(true);
+    try {
+      const res = await discoveryService.flushCache();
+      const hours = Math.round(res.cache_ttl_seconds / 3600);
+      toast.success(
+        res.total_entries > 0
+          ? `Cache cleared — recomputing, next result holds for ${hours}h`
+          : `Cache was already empty — recomputing, next result holds for ${hours}h`,
+      );
+      await load();
+    } catch (e) {
+      toast.error(e instanceof Error ? e.message : 'Cache flush failed');
+    } finally {
+      setFlushing(false);
     }
   };
 
@@ -427,8 +449,19 @@ export function DiscoveryPage() {
             <Button
               variant="outline"
               size="sm"
+              onClick={handleFlushCache}
+              disabled={loading || flushing}
+              className="gap-1.5"
+              title="Discard the cached ranking and recompute now. Ideas are cached for 4 hours, so Refresh alone re-serves the same list until it expires."
+            >
+              {flushing ? <Loader2 className="h-3 w-3 animate-spin" /> : <Trash2 className="h-3 w-3" />}
+              Flush cache
+            </Button>
+            <Button
+              variant="outline"
+              size="sm"
               onClick={() => load()}
-              disabled={loading}
+              disabled={loading || flushing}
               className="gap-1.5"
             >
               {loading ? <Loader2 className="h-3 w-3 animate-spin" /> : <RefreshCw className="h-3 w-3" />}

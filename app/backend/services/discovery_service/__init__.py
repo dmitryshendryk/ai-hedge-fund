@@ -1,4 +1,4 @@
-"""Discovery service public API — get_ideas() with 1h cache + snapshot history.
+"""Discovery service public API — get_ideas() with 4h cache + snapshot history.
 
 On fresh compute (cache miss):
   1. Persist a DiscoverySnapshot row per idea (enables historical score tracking).
@@ -34,7 +34,7 @@ logger = logging.getLogger(__name__)
 
 _HIGH_CONFLUENCE_MIN_SOURCES: int = 4
 _HIGH_CONFLUENCE_MIN_SCORE: float = 80.0
-_CACHE_TTL_SECONDS: float = 3600.0  # 1 hour
+_CACHE_TTL_SECONDS: float = 4 * 3600.0  # 4 hours
 _CONCENTRATION_SAMPLE_SIZE: int = 200  # sector HUD computed over top-N, stable across pages
 
 # Holds the full ranked universe per cold compute. Snapshot dataclass packages
@@ -47,7 +47,7 @@ class _CachedUniverse:
     generated_at: str
 
 
-# Single-entry cache (replaces the per-limit dict). One universe per hour.
+# Single-entry cache (replaces the per-limit dict). One universe per TTL window.
 _cache: dict[str, tuple[_CachedUniverse, float]] = {}
 _CACHE_KEY = "discovery:full"
 
@@ -287,10 +287,40 @@ async def _get_or_compute_universe() -> _UniverseLookup:
     return _UniverseLookup(universe=universe, cached=False)
 
 
+def get_cache_ttl_seconds() -> float:
+    """How long a computed universe stays served before recompute."""
+    return _CACHE_TTL_SECONDS
+
+
+def flush_cache() -> dict[str, int]:
+    """Drop the cached universe so the next request recomputes from scratch.
+
+    Cancels any in-flight refresh too: without that, a request arriving during
+    a compute that started before the flush would await it and receive the very
+    ranking the caller asked to discard.
+
+    Returns:
+        {label: entries_cleared} for the caches this owns, so a UI can report
+        whether anything was actually cached.
+    """
+    entries = len(_cache)
+    _cache.clear()
+
+    cancelled = 0
+    for task in list(_inflight_refreshes.values()):
+        if isinstance(task, asyncio.Task) and not task.done():
+            task.cancel()
+            cancelled += 1
+    _inflight_refreshes.clear()
+
+    logger.info("discovery: cache flushed (%d universe, %d in-flight cancelled)", entries, cancelled)
+    return {"discovery_ideas": entries, "discovery_inflight": cancelled}
+
+
 async def get_ideas_page(page: int = 1, page_size: int = 100) -> DiscoveryResponse:
     """Return ONE page from the cached ranked universe.
 
-    Cold compute runs once per hour (~30-40s). Subsequent pages slice the
+    Cold compute runs once per TTL window (~30-40s). Subsequent pages slice the
     cached list and enrich just their slice (~3-5s, sub-50ms once the
     fundamentals 24h cache is warm).
     """

@@ -1,4 +1,4 @@
-"""Discovery source: same insider buying the same ticker 3+ times in 30 days.
+"""Discovery source: same insider buying the same ticker repeatedly in 30 days.
 
 Captures the "building a position" pattern — insiders who keep coming back to
 the open market over weeks signal real conviction (vs. one-off rebalancing).
@@ -9,7 +9,7 @@ multiple repeat-buyers; we emit one IdeaSignal per ticker, capturing the most
 prolific insider as the primary.
 
 Score:
-  - 20 base when one insider has 3+ distinct trade dates
+  - 20 base when one insider has 2+ distinct trade dates
   - 30 if 5+ trade dates OR 2+ distinct insiders both repeating
 """
 
@@ -20,7 +20,7 @@ from app.backend.models.discovery_schemas import IdeaSignal
 
 logger = logging.getLogger(__name__)
 
-_MIN_TRADES_PER_INSIDER = 3
+_MIN_TRADES_PER_INSIDER = 2
 _PROLIFIC_TRADES = 5
 
 

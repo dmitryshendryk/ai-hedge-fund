@@ -1,6 +1,7 @@
 """Shared utilities + cache config for fundamentals_service submodules."""
 
 import logging
+import math
 from typing import Protocol, cast
 
 import yfinance as yf
@@ -18,13 +19,18 @@ class _DataFrameProto(Protocol):
 
 
 def safe_float(value: object) -> float | None:
+    """Coerce to float; reject None, NaN, +inf, -inf, and unparseable values.
+
+    JSON cannot serialize NaN / inf — letting them through here causes a
+    500 in the response renderer at the API boundary.
+    """
     if value is None:
         return None
     try:
         f = float(value)
     except (TypeError, ValueError):
         return None
-    if f != f:  # NaN guard
+    if not math.isfinite(f):
         return None
     return f
 

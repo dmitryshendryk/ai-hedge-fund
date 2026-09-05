@@ -17,6 +17,7 @@ Score tiers:
 
 import asyncio
 import logging
+import math
 from datetime import date, timedelta
 
 from app.backend.models.discovery_schemas import IdeaSignal
@@ -84,7 +85,12 @@ async def fetch() -> list[tuple[str, IdeaSignal]]:
     for etf, res in zip(unique_etfs, etf_results, strict=True):
         if isinstance(res, BaseException) or res is None:
             continue
-        etf_returns[etf] = (res.end_price / res.start_price - 1.0) * 100.0
+        if res.start_price <= 0:
+            continue
+        ret = (res.end_price / res.start_price - 1.0) * 100.0
+        if not math.isfinite(ret):
+            continue
+        etf_returns[etf] = ret
 
     if not etf_returns:
         logger.info("relative_strength: no sector ETF returns available")
@@ -103,7 +109,11 @@ async def fetch() -> list[tuple[str, IdeaSignal]]:
     for (ticker, sector_etf), res in zip(eligible, ticker_results, strict=True):
         if isinstance(res, BaseException) or res is None:
             continue
+        if res.start_price <= 0:
+            continue
         ticker_return_pct = (res.end_price / res.start_price - 1.0) * 100.0
+        if not math.isfinite(ticker_return_pct):
+            continue
         sector_return_pct = etf_returns[sector_etf]
         alpha = ticker_return_pct - sector_return_pct
         if alpha < _MIN_ALPHA_PCT:

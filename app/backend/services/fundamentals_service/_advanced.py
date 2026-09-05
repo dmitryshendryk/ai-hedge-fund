@@ -104,6 +104,76 @@ def interest_coverage(ebit: float | None, interest_expense: float | None) -> flo
     return round(operating_profit / interest, 2)
 
 
+@dataclass(frozen=True)
+class ShareholderYield:
+    """Capital returned to shareholders by route, as percent of market cap.
+
+    Each route is netted against its matching inflow and floored at zero, so a
+    company that raised more than it retired scores that route as nothing
+    returned instead of as a credit against the other two.
+    """
+    dividend_pct: float
+    buyback_pct: float
+    debt_paydown_pct: float
+    total_pct: float
+
+
+def _net_return_of_capital(outflow: float | None, inflow: float | None) -> float:
+    """Capital retired less capital raised, floored at zero.
+
+    Args:
+        outflow: Cash paid out. Sign is ignored; yfinance reports it negative.
+        inflow: Cash raised through the same instrument. Sign is ignored.
+    """
+    paid = abs(_finite(outflow) or 0.0)
+    raised = abs(_finite(inflow) or 0.0)
+    return max(0.0, paid - raised)
+
+
+def true_shareholder_yield(
+    market_cap: float | None,
+    dividends_paid: float | None = None,
+    buybacks: float | None = None,
+    stock_issuance: float | None = None,
+    debt_repayment: float | None = None,
+    debt_issuance: float | None = None,
+) -> ShareholderYield | None:
+    """Dividends, net buybacks and net debt paydown as percent of market cap.
+
+    Debt paydown counts because retiring debt hands enterprise value to equity
+    holders as surely as a buyback does.
+
+    Args:
+        market_cap: Current market capitalisation; zero and negative are rejected.
+        dividends_paid: Never netted — a dividend has no matching inflow.
+
+    Returns:
+        None when market cap is absent or not positive. A missing statement row
+        counts as nothing returned by that route, never as a negative.
+    """
+    cap = _finite(market_cap)
+    if cap is None or cap <= 0:
+        return None
+
+    dividends = abs(_finite(dividends_paid) or 0.0)
+    net_buyback = _net_return_of_capital(buybacks, stock_issuance)
+    net_debt_paydown = _net_return_of_capital(debt_repayment, debt_issuance)
+
+    dividend_pct = dividends / cap * 100.0
+    buyback_pct = net_buyback / cap * 100.0
+    debt_paydown_pct = net_debt_paydown / cap * 100.0
+    total_pct = dividend_pct + buyback_pct + debt_paydown_pct
+    if not math.isfinite(total_pct):
+        return None
+
+    return ShareholderYield(
+        dividend_pct=round(dividend_pct, 2),
+        buyback_pct=round(buyback_pct, 2),
+        debt_paydown_pct=round(debt_paydown_pct, 2),
+        total_pct=round(total_pct, 2),
+    )
+
+
 def _ratio(numerator: float | None, denominator: float | None) -> float | None:
     num = _finite(numerator)
     den = _finite(denominator)

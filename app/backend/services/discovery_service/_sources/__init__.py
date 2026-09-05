@@ -12,16 +12,23 @@ from . import (
     dividend_grower,
     fcf_yield,
     first_time_buyer,
+    gov_contract_win,
     high_roic,
+    hiring_velocity,
     insider_doubling_down,
     mega_dollar_buy,
+    piotroski_score,
     quality_score,
     relative_strength,
     repeat_buyer,
     revenue_acceleration,
+    share_cannibal,
     spinoff,
     squeeze,
+    thirteenf_new_buy,
+    true_shareholder_yield,
     valuation_score,
+    vcp_breakout_setup,
 )
 from app.backend.models.discovery_schemas import IdeaSignal
 
@@ -49,4 +56,16 @@ SOURCES: list[tuple[str, SourceFn]] = [
     ("dividend_grower", dividend_grower.fetch),
     ("fcf_yield", fcf_yield.fetch),
     ("high_roic", high_roic.fetch),
+    ("gov_contract_win", gov_contract_win.fetch),
+    ("hiring_velocity", hiring_velocity.fetch),
+    ("share_cannibal", share_cannibal.fetch),
+    ("thirteenf_new_buy", thirteenf_new_buy.fetch),
+    ("vcp_breakout_setup", vcp_breakout_setup.fetch),
+    ("true_shareholder_yield", true_shareholder_yield.fetch),
+    ("piotroski_score", piotroski_score.fetch),
 ]
+
+# kronos_predictive_surge is deliberately unregistered, and no Devil's Advocate
+# detector reads Kronos either. Measured prob_up clusters at 0.03/0.97 rather
+# than spreading like a probability, and the forecast sign flips with the
+# lookback window. tools/kronos_backtest.py is what would justify enabling it.

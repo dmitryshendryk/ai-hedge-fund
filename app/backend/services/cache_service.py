@@ -37,7 +37,9 @@ class _FlushResult:
 
 
 _REGISTRY: tuple[_CacheRef, ...] = (
+    _CacheRef("app.backend.services.discovery_service", "_cache", "discovery_ideas"),
     _CacheRef("app.backend.services.pricing_service", "_period_cache", "pricing"),
+    _CacheRef("app.backend.services.pricing_service", "_snapshot_cache", "pricing_snapshots"),
     _CacheRef("app.backend.services.pricing_service", "_inflight_locks", "pricing_inflight_locks"),
     _CacheRef("app.backend.services.fundamentals_service._metrics", "_cache", "company_metrics"),
     _CacheRef("app.backend.services.fundamentals_service._revenue", "_cache", "revenue_growth"),
@@ -52,6 +54,7 @@ _REGISTRY: tuple[_CacheRef, ...] = (
     _CacheRef("app.backend.services.news_service", "_article_cache", "news_articles"),
     _CacheRef("app.backend.services.insider_service", "_insider_cache", "insider"),
     _CacheRef("app.backend.services.discovery_service._sources.commodity_tailwind", "_series_cache", "commodity_tailwind"),
+    _CacheRef("app.backend.services.discovery_service._sources.analyst", "_cache", "analyst_recommendations"),
 )
 
 
@@ -133,11 +136,39 @@ def _reset_yfinance_cooldown() -> _FlushResult:
     return _FlushResult("yfinance_cooldown", 1 if was_active else 0)
 
 
+def _flush_macro_regime() -> _FlushResult:
+    """Macro regime caches one MacroRegime in module-level vars, not a dict —
+    delegate to the service's own invalidate_cache() helper.
+    """
+    try:
+        module = import_module("app.backend.services.macro_service")
+    except ImportError:
+        return _FlushResult("macro_regime", 0)
+    had_value = module.__dict__.get("_cache") is not None
+    invalidator = module.__dict__.get("invalidate_cache")
+    if callable(invalidator):
+        invalidator()
+    return _FlushResult("macro_regime", 1 if had_value else 0)
+
+
+def _flush_kronos() -> _FlushResult:
+    """Kronos caches one parsed artifact in a module variable, not a container —
+    delegate to the service's own clear_cache() helper.
+    """
+    try:
+        module = import_module("app.backend.services.kronos_service")
+    except ImportError:
+        return _FlushResult("kronos_forecasts", 0)
+    clearer = module.__dict__.get("clear_cache")
+    return _FlushResult("kronos_forecasts", clearer() if callable(clearer) else 0)
+
+
 def flush_all() -> dict[str, int]:
     """Clear every registered cache. Returns {label: entries_cleared}.
 
-    Discovery itself no longer caches, so the next page load will compute
-    fresh against now-clean fundamentals/pricing/news caches.
+    Wider than discovery_service.flush_cache(), which drops only the ranked
+    universe: this also empties the shared fundamentals, pricing and news caches
+    those sources read, so the next compute pays full cold cost.
     """
     cleared: dict[str, int] = {}
 
@@ -152,7 +183,7 @@ def flush_all() -> dict[str, int]:
             logger.warning("cache flush: failed to clear %s: %s", ref.label, exc)
             cleared[ref.label] = 0
 
-    for fn in (_flush_activist_13d_module, _flush_inflight_refreshes, _reset_yfinance_cooldown):
+    for fn in (_flush_activist_13d_module, _flush_inflight_refreshes, _reset_yfinance_cooldown, _flush_macro_regime, _flush_kronos):
         result = fn()
         cleared[result.label] = result.cleared
 
@@ -164,5 +195,5 @@ def flush_all() -> dict[str, int]:
 def list_caches() -> Iterable[str]:
     """Return labels of every cache the registry knows about."""
     labels = [ref.label for ref in _REGISTRY]
-    labels.extend(["activist_13d", "discovery_inflight", "yfinance_cooldown"])
+    labels.extend(["activist_13d", "discovery_inflight", "yfinance_cooldown", "macro_regime", "kronos_forecasts"])
     return labels

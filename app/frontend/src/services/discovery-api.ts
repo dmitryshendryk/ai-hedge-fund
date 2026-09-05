@@ -59,6 +59,12 @@ export interface DiscoveryResponse {
   has_more: boolean;
 }
 
+export interface DiscoveryCacheFlushResponse {
+  cleared: Record<string, number>;
+  total_entries: number;
+  cache_ttl_seconds: number;
+}
+
 export interface PageRequest {
   page?: number;        // 1-based
   pageSize?: number;    // default 100, max 200
@@ -82,6 +88,15 @@ class DiscoveryService {
     if (!r.ok) {
       const body = await r.json().catch(() => null);
       throw new Error(body?.detail || `Discovery fetch failed: ${r.statusText}`);
+    }
+    return r.json();
+  }
+
+  async flushCache(): Promise<DiscoveryCacheFlushResponse> {
+    const r = await fetch(`${this.baseUrl}/cache/flush`, { method: 'POST' });
+    if (!r.ok) {
+      const body = await r.json().catch(() => null);
+      throw new Error(body?.detail || `Cache flush failed: ${r.statusText}`);
     }
     return r.json();
   }

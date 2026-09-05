@@ -8,7 +8,9 @@ import { ModelSelector } from '@/components/ui/llm-selector';
 import { useSettings } from '@/contexts/settings-context';
 import { alertService, type AlertSettingsResponse } from '@/services/alert-api';
 import { cacheService } from '@/services/cache-api';
+import { devilsAdvocateService } from '@/services/devils_advocate-api';
 import { whaleService, type WhaleFund, type WhaleFundCandidate } from '@/services/whale-api';
+import { cn } from '@/lib/utils';
 
 const PANEL_CLASS =
   'hud-corner-bracket border border-primary/25 bg-card/60 backdrop-blur-md backdrop-saturate-150 p-6 rounded-md space-y-4 shadow-[0_4px_24px_hsl(210_55%_3%/0.45),inset_0_1px_0_hsl(var(--primary)/0.1)]';
@@ -46,6 +48,10 @@ export function SettingsPage() {
   const [csuiteMinValue, setCsuiteMinValue] = useState(250000);
   const [savingCsuite, setSavingCsuite] = useState(false);
 
+  // Devil's Advocate toggle — null = unknown, then bool from server.
+  const [daEnabled, setDaEnabled] = useState<boolean | null>(null);
+  const [daSaving, setDaSaving] = useState(false);
+
   const loadAlertSettings = async () => {
     try {
       const s = await alertService.getSettings();
@@ -67,6 +73,31 @@ export function SettingsPage() {
   useEffect(() => {
     loadAlertSettings();
   }, []);
+
+  // Devil's Advocate: fetch toggle state once on mount. Failure → render as off.
+  useEffect(() => {
+    let cancelled = false;
+    devilsAdvocateService
+      .getSettings()
+      .then((s) => { if (!cancelled) setDaEnabled(s.enabled); })
+      .catch(() => { if (!cancelled) setDaEnabled(false); });
+    return () => { cancelled = true; };
+  }, []);
+
+  const handleToggleDevilsAdvocate = async () => {
+    if (daEnabled === null || daSaving) return;
+    const next = !daEnabled;
+    setDaSaving(true);
+    try {
+      const updated = await devilsAdvocateService.setSettings(next);
+      setDaEnabled(updated.enabled);
+      toast.success(`Devil's Advocate ${updated.enabled ? 'enabled' : 'disabled'}`);
+    } catch (e) {
+      toast.error(e instanceof Error ? e.message : 'Failed to update Devil’s Advocate setting');
+    } finally {
+      setDaSaving(false);
+    }
+  };
 
   const loadWhales = async () => {
     setWhaleLoading(true);
@@ -272,6 +303,41 @@ export function SettingsPage() {
               Active: <span className="text-primary">{selectedModel.model_name}</span> ({selectedModel.provider})
             </p>
           )}
+        </section>
+
+        {/* Devil's Advocate — opt-in bear-thesis overlay. Read-only; never alters Discovery scores. */}
+        <section className={PANEL_CLASS}>
+          <div>
+            <h2 className="text-lg font-semibold text-foreground tracking-wide">Devil's Advocate</h2>
+            <p className="text-sm text-muted-foreground mt-1">
+              Surface a per-ticker "Red Flag" badge on Discovery rows alongside the existing bullish
+              score. Off by default. When on, Discovery scoring, sorting, filters, and pagination are
+              unchanged — the badge is purely an overlay.
+            </p>
+            <p className="text-xs text-muted-foreground/80 mt-2">
+              Active detector: CEO/CFO Form 4 divergence (180d window). More detectors come later.
+            </p>
+          </div>
+          <div className="flex items-center gap-3">
+            <Button
+              type="button"
+              onClick={handleToggleDevilsAdvocate}
+              disabled={daEnabled === null || daSaving}
+              variant={daEnabled ? 'default' : 'outline'}
+              size="sm"
+            >
+              {daSaving && <Loader2 className="h-3 w-3 mr-1 animate-spin" />}
+              {daEnabled === null ? 'Loading…' : daEnabled ? 'Enabled — click to disable' : 'Disabled — click to enable'}
+            </Button>
+            <span className={cn(
+              'text-xs font-data uppercase tracking-wider px-2 py-0.5 rounded border',
+              daEnabled
+                ? 'border-primary/40 bg-primary/10 text-primary'
+                : 'border-muted-foreground/30 bg-muted/30 text-muted-foreground',
+            )}>
+              {daEnabled === null ? '—' : daEnabled ? 'ON' : 'OFF'}
+            </span>
+          </div>
         </section>
 
         {/* Alerts: Telegram */}

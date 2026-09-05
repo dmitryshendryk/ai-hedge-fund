@@ -68,6 +68,18 @@ class DiscoveryResponse(BaseModel):
     has_more: bool = False
 
 
+class DiscoveryCacheFlushResponse(BaseModel):
+    """What a Discovery cache flush actually discarded.
+
+    Mirrors the platform-wide POST /cache/flush shape so one client handler
+    covers both. Counts are zero when nothing was cached, which the UI reports
+    rather than claiming a refresh happened.
+    """
+    cleared: dict[str, int]
+    total_entries: int
+    cache_ttl_seconds: float  # how long the next compute stays cached
+
+
 class DiscoverySnapshotItem(BaseModel):
     """One historical snapshot of a ticker's Discovery score."""
     ticker: str
